@@ -1,62 +1,73 @@
 #!/bin/bash
-# Usage: ./disk_cleaner.sh b z
-# Quét từ /dev/sdb -> /dev/sdz (có confirm y/n từng ổ)
+# Disk Cleaner Script - Xóa sạch dấu vết LVM, RAID, Ceph OSD, filesystem trên các ổ đĩa
+# Tác giả: TrungLun0112
+# Repo: https://github.com/TrungLun0112/disk-wipefs
 
-start=$1
-end=$2
+# Kiểm tra tham số
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <start_letter> <end_letter>"
+    echo "Ví dụ: $0 b z   # kiểm tra từ /dev/sdb đến /dev/sdz"
+    exit 1
+fi
 
-for letter in $(eval echo {$start..$end}); do
-    disk="/dev/sd$letter"
-    size=$(blockdev --getsz $disk)   # tổng sector
-    echo ""
-    echo ">>> Phát hiện ổ $disk"
-    read -p "Bạn có muốn xoá dữ liệu trên $disk không? (y/n): " confirm
+START=$1
+END=$2
 
-    if [[ "$confirm" != "y" ]]; then
-        echo "   -> Bỏ qua $disk"
+for DRIVE in $(eval echo {$START..$END}); do
+    DEV="/dev/sd$DRIVE"
+    if [ ! -b "$DEV" ]; then
+        echo "❌ Bỏ qua $DEV (không tồn tại)"
         continue
     fi
 
-    echo ">>> Đang xử lý $disk ..."
+    echo "🔍 Kiểm tra ổ đĩa: $DEV"
 
-    # 1. LVM
-    if pvs --noheadings -o pv_name 2>/dev/null | grep -qw "$disk"; then
-        vg=$(pvs --noheadings -o vg_name $disk | xargs)
-        lvremove -y $vg >/dev/null 2>&1
-        vgremove -y $vg >/dev/null 2>&1
-        pvremove -y $disk >/dev/null 2>&1
-        echo "   -> Xoá LVM PV + VG + LV"
-    fi
+    CLEAN=false
 
-    # 2. RAID
-    if mdadm --examine $disk >/dev/null 2>&1; then
-        mdadm --zero-superblock $disk >/dev/null 2>&1
-        echo "   -> Xoá RAID superblock"
-    fi
-
-    # 3. Ceph OSD
-    if command -v ceph-volume >/dev/null 2>&1; then
-        if ceph-volume lvm list $disk >/dev/null 2>&1; then
-            ceph-volume lvm zap $disk --destroy >/dev/null 2>&1
-            echo "   -> Xoá Ceph OSD metadata"
+    # Kiểm tra LVM PV
+    if pvs "$DEV" &>/dev/null; then
+        echo "  -> Phát hiện LVM PV trên $DEV"
+        vg=$(pvs --noheadings -o vg_name "$DEV" | awk '{print $1}')
+        if [ -n "$vg" ]; then
+            echo "  -> Xóa VG: $vg"
+            vgremove -ff "$vg"
         fi
+        pvremove -ff "$DEV"
+        CLEAN=true
     fi
 
-    # 4. ZFS label
-    if command -v zpool >/dev/null 2>&1; then
-        zpool labelclear -f $disk >/dev/null 2>&1
-        echo "   -> Xoá ZFS label"
+    # Kiểm tra RAID
+    if mdadm --examine "$DEV" &>/dev/null; then
+        echo "  -> Phát hiện RAID member trên $DEV"
+        mdadm --zero-superblock --force "$DEV"
+        CLEAN=true
     fi
 
-    # 5. Wipefs & GPT/MBR
-    wipefs -a -f $disk >/dev/null 2>&1
-    sgdisk --zap-all $disk >/dev/null 2>&1
-    echo "   -> Xoá GPT/MBR"
+    # Kiểm tra Ceph OSD
+    if blkid "$DEV" | grep -qi ceph; then
+        echo "  -> Phát hiện Ceph OSD trên $DEV"
+        dd if=/dev/zero of="$DEV" bs=1M count=10 conv=fsync
+        CLEAN=true
+    fi
 
-    # 6. Xoá đầu & cuối đĩa
-    dd if=/dev/zero of=$disk bs=1M count=10 conv=fdatasync >/dev/null 2>&1
-    dd if=/dev/zero of=$disk bs=1M count=10 seek=$((size/2048 - 10)) conv=fdatasync >/dev/null 2>&1
-    echo "   -> Đã xoá 10MB đầu và 10MB cuối"
+    # Kiểm tra filesystem thông thường
+    if blkid "$DEV" | grep -q 'TYPE='; then
+        echo "  -> Phát hiện filesystem trên $DEV"
+        CLEAN=true
+    fi
 
-    echo ">>> Hoàn tất $disk"
+    if [ "$CLEAN" = true ]; then
+        read -p "⚠️ Bạn có chắc muốn xóa sạch $DEV? (y/n): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            echo "  -> Đang wipefs $DEV ..."
+            wipefs -a -f "$DEV"
+            echo "✅ Đã làm sạch $DEV"
+        else
+            echo "⏭️ Bỏ qua $DEV"
+        fi
+    else
+        echo "ℹ️ Không phát hiện dấu vết đặc biệt trên $DEV"
+    fi
+
+    echo "--------------------------------------"
 done
