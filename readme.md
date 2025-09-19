@@ -5,7 +5,7 @@ git clone https://github.com/TrungLun0112/disk-wipefs.git
 
 cd disk-wipefs
 
-chmod +x disk_cleaner.sh
+chmod +x disk-wipefs.sh
 
-./disk_cleaner.sh b e
+./disk-wipefs.sh b e
 ```
