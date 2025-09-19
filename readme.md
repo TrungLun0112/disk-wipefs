@@ -1,5 +1,8 @@
 ```
+Cài git make:
 apt install git make gcc -y
+
+Clone nó:
 git clone https://github.com/TrungLun0112/disk-wipefs.git
 cd disk-wipefs
 chmod +x disk-wipefs.sh
