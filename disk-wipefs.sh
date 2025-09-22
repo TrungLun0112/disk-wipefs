@@ -1,129 +1,156 @@
-#!/bin/bash
-# ============================================================
-#  disk-wipefs.sh - Advanced Disk Cleaner with Verbose Logging
-#  Author: ChatGPT (OpenAI) & TrungLun0112
-#  Repo: https://github.com/TrungLun0112/disk-wipefs
+#!/usr/bin/env bash
 #
-#  Features:
-#   - Detect and clean LVM PV, RAID, Ceph OSD signatures
-#   - Wipe filesystem signatures with wipefs
-#   - Reload disk partitions using multiple methods (partprobe, blockdev, kpartx, SCSI rescan)
-#   - Supports manual (confirm y/n) or auto (no prompt) mode
-#   - Colorful verbose logs
-#   - Trap for Ctrl+C
+# disk-wipefs.sh - Strong disk cleaner tool
 #
-#  Usage:
-#    ./disk-wipefs.sh <start_letter> [end_letter] [--auto|--manual]
-#    Example:
-#      ./disk-wipefs.sh b d        # clean sdb to sdd, ask confirm each disk
-#      ./disk-wipefs.sh f --auto   # clean sdf only, no confirm
+# Author: ChatGPT & TrungLun0112
+# Repo  : https://github.com/TrungLun0112/disk-wipefs
 #
-# ============================================================
+# Description:
+#   Safely wipe disks by removing all filesystem/RAID/LVM/ZFS/Ceph traces.
+#   Includes verbose logging, color output, confirmation mode or auto mode,
+#   and disk reload after wipe.
+#
+#   ⚠️ WARNING: This script is destructive. Use at your own risk.
+#
 
-# ========== COLORS ==========
-RED="\033[1;31m"
-GREEN="\033[1;32m"
-YELLOW="\033[1;33m"
-BLUE="\033[1;34m"
-NC="\033[0m" # No Color
+# ---------------- Colors ----------------
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+RESET="\e[0m"
 
-# ========== TRAP ==========
-trap 'echo -e "\n${RED}[EXIT] Script interrupted by user (Ctrl+C).${NC}"; exit 1' INT
+log() { echo -e "${BLUE}[INFO]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+error() { echo -e "${RED}[ERROR]${RESET} $*"; }
+success() { echo -e "${GREEN}[OK]${RESET} $*"; }
 
-# ========== FUNCTIONS ==========
+# ---------------- Trap ----------------
+trap 'echo -e "\n${YELLOW}[WARN] Interrupted by user (Ctrl+C). Exiting safely.${RESET}"; exit 1' INT
 
-log_info()   { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_warn()   { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error()  { echo -e "${RED}[ERROR]${NC} $1"; }
-log_success(){ echo -e "${GREEN}[OK]${NC} $1"; }
-
-check_disk() {
-    local dev=$1
-    log_info "Checking disk /dev/$dev ..."
-    pvs /dev/$dev &>/dev/null && log_warn "/dev/$dev is LVM PV"
-    mdadm --examine /dev/$dev &>/dev/null && log_warn "/dev/$dev is part of RAID"
-    ceph-volume lvm list /dev/$dev &>/dev/null && log_warn "/dev/$dev may be a Ceph OSD"
-}
-
-clean_disk() {
-    local dev=$1
-    log_info "Cleaning disk /dev/$dev ..."
-
-    # Deactivate LVM if present
-    pvs /dev/$dev &>/dev/null && {
-        log_info "Removing LVM PV from /dev/$dev ..."
-        vgchange -an >/dev/null 2>&1
-        pvremove -ff -y /dev/$dev >/dev/null 2>&1
-    }
-
-    # Zero RAID superblock
-    mdadm --examine /dev/$dev &>/dev/null && {
-        log_info "Wiping RAID metadata from /dev/$dev ..."
-        mdadm --zero-superblock /dev/$dev >/dev/null 2>&1
-    }
-
-    # Zap GPT/MBR partition table
-    log_info "Zapping partition table on /dev/$dev ..."
-    sgdisk --zap-all /dev/$dev >/dev/null 2>&1
-
-    # Wipe filesystem signatures
-    log_info "Wiping filesystem signatures on /dev/$dev ..."
-    wipefs -a /dev/$dev >/dev/null 2>&1
-
-    # Reload disk partitions
-    reload_disk $dev
-
-    log_success "/dev/$dev cleaned successfully."
-}
-
+# ---------------- Functions ----------------
 reload_disk() {
-    local dev=$1
-    log_info "Reloading disk /dev/$dev ..."
-    partprobe /dev/$dev >/dev/null 2>&1
-    blockdev --rereadpt /dev/$dev >/dev/null 2>&1
-    kpartx -u /dev/$dev >/dev/null 2>&1
-    for host in /sys/class/scsi_host/host*; do
-        echo "- - -" > $host/scan
-    done
-    log_success "Disk /dev/$dev reloaded."
+    local dev="$1"
+    log "Reloading disk ${dev}..."
+    partprobe "$dev" &>/dev/null || true
+    blockdev --rereadpt "$dev" &>/dev/null || true
+    kpartx -u "$dev" &>/dev/null || true
+    echo 1 > /sys/class/block/"$(basename $dev)"/device/rescan 2>/dev/null || true
+    success "Disk ${dev} reloaded."
 }
 
-# ========== MAIN SCRIPT ==========
+wipe_disk() {
+    local dev="$1"
 
-if [[ $# -lt 1 ]]; then
-    log_error "Usage: $0 <start_letter> [end_letter] [--auto|--manual]"
-    exit 1
-fi
-
-start_letter=$1
-end_letter=${2:-$1}   # if only 1 arg -> start=end
-mode="ask"
-
-# Check mode flag
-[[ "$2" == "--auto" || "$3" == "--auto" ]] && mode="auto"
-[[ "$2" == "--manual" || "$3" == "--manual" ]] && mode="ask"
-
-# If mode not chosen, ask user
-if [[ $mode == "ask" && "$2" != "--manual" && "$3" != "--manual" ]]; then
-    echo -e "${YELLOW}Choose mode:${NC}"
-    echo "  1) Auto (no confirm, wipe all)"
-    echo "  2) Manual (confirm each disk)"
-    read -p "Enter choice [1-2]: " choice
-    [[ "$choice" == "1" ]] && mode="auto" || mode="ask"
-fi
-
-log_info "Running in mode: $mode"
-log_info "Target disks: from s$start_letter to s$end_letter"
-
-for dev in $(eval echo {${start_letter}..${end_letter}}); do
-    if [[ $mode == "ask" ]]; then
-        check_disk sd$dev
-        read -p "Do you want to clean /dev/sd$dev? (y/n): " ans
-        [[ $ans == "y" ]] && clean_disk sd$dev || log_warn "Skipped /dev/sd$dev"
-    else
-        check_disk sd$dev
-        clean_disk sd$dev
+    # Skip loop, sr, dm
+    if [[ "$dev" =~ ^/dev/loop ]] || [[ "$dev" =~ ^/dev/sr ]]; then
+        warn "Skipping $dev (loop/sr device)"
+        return
     fi
+    if [[ "$dev" =~ ^/dev/dm- ]] || [[ "$dev" =~ ^/dev/mapper/ ]]; then
+        warn "Skipping $dev (device mapper)"
+        return
+    fi
+
+    # Skip sda unless --force
+    if [[ "$dev" == "/dev/sda" && "$FORCE_SDA" != "1" ]]; then
+        warn "Skipping /dev/sda (system disk). Use --force to override."
+        return
+    fi
+
+    log "Checking disk type for $dev..."
+    blkid "$dev" || true
+    pvs "$dev" 2>/dev/null || true
+    mdadm --examine "$dev" 2>/dev/null | head -n 5 || true
+    zpool labelclear -n "$dev" 2>/dev/null || true
+
+    if [[ "$MODE" == "manual" ]]; then
+        read -p "Wipe $dev? (y/n): " ans
+        [[ "$ans" != "y" ]] && warn "Skipped $dev" && return
+    fi
+
+    log "Wiping $dev..."
+    wipefs -a "$dev" || true
+    sgdisk --zap-all "$dev" &>/dev/null || true
+
+    # Optional Ceph
+    if [[ "$ZAP_CEPH" == "1" ]]; then
+        log "Zapping Ceph metadata on $dev..."
+        ceph-volume lvm zap --destroy "$dev" || true
+    fi
+
+    # Optional ZFS
+    if [[ "$ZAP_ZFS" == "1" ]]; then
+        log "Clearing ZFS label on $dev..."
+        zpool labelclear -f "$dev" || true
+    fi
+
+    success "Wipe completed for $dev"
+    reload_disk "$dev"
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  ./disk-wipefs.sh [options] <disks...>
+
+Examples:
+  ./disk-wipefs.sh sdb sdc nvme0n1
+  ./disk-wipefs.sh all -sda -nvme0n1   # wipe all except system disks
+  ./disk-wipefs.sh sd* nvme* vd* mmcblk*
+
+Options:
+  --auto        Run in automatic mode (no confirmation).
+  --manual      Run in manual confirm mode (default if no flag).
+  --force       Allow wiping /dev/sda (system disk).
+  --zap-ceph    Run Ceph zap if Ceph metadata is found.
+  --zap-zfs     Run ZFS labelclear if ZFS metadata is found.
+
+Notes:
+  - loop and sr devices are always skipped.
+  - device-mapper (dm-*) devices are skipped; wipe the underlying disk instead.
+EOF
+    exit 1
+}
+
+# ---------------- Main ----------------
+ARGS=()
+MODE="manual"
+FORCE_SDA=0
+ZAP_CEPH=0
+ZAP_ZFS=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --auto) MODE="auto";;
+        --manual) MODE="manual";;
+        --force) FORCE_SDA=1;;
+        --zap-ceph) ZAP_CEPH=1;;
+        --zap-zfs) ZAP_ZFS=1;;
+        -*) EXCLUDE+=("${arg#-}");;
+        all) ALL=1;;
+        *) ARGS+=("$arg");;
+    esac
 done
 
-log_success "All tasks completed."
+if [[ ${#ARGS[@]} -eq 0 && "$ALL" != "1" ]]; then
+    usage
+fi
+
+if [[ "$ALL" == "1" ]]; then
+    # Collect all disks
+    mapfile -t DISKS < <(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}')
+    # Apply exclusions
+    for ex in "${EXCLUDE[@]}"; do
+        DISKS=("${DISKS[@]/\/dev\/$ex/}")
+    done
+else
+    DISKS=("${ARGS[@]/#/\/dev\/}")
+fi
+
+log "Mode: $MODE"
+log "Disks to wipe: ${DISKS[*]}"
+
+for dev in "${DISKS[@]}"; do
+    wipe_disk "$dev"
+done
