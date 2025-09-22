@@ -14,16 +14,12 @@ A powerful and safe disk wipe utility script.
 Written by **ChatGPT** & **TrungLun0112**.  
 👉 Repo: [disk-wipefs](https://github.com/TrungLun0112/disk-wipefs)
 
----
-
 ## ⚠️ Warning
 
 This script is **destructive**.  
 It will erase all filesystem / RAID / LVM / Ceph / ZFS traces from the selected disks.  
 Use it **only if you are 100% sure** you want to wipe the disks.  
 Always double-check the target devices before running.
-
----
 
 ## ✨ Features
 
@@ -41,8 +37,6 @@ Always double-check the target devices before running.
 - Pattern matching (e.g., `sd*`, `nvme*`, `vd*`, `mmcblk*`).
 - Exclude disks when running `all` (e.g., `-sda`, `-nvme0n1`).
 - Trap `Ctrl+C` to exit safely with a warning message.
-
----
 
 ## 🚀 Usage
 
