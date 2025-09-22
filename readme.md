@@ -67,3 +67,30 @@ Always double-check the target devices before running.
 
 # With Ceph/ZFS cleanup
 ./disk-wipefs.sh --zap-ceph --zap-zfs nvme0n1
+
+## ⚙️ Options
+Option	Description
+--auto	Run in automatic mode (no confirmation).
+--manual	Run in manual confirm mode (default if no flag is given).
+--force	Allow wiping /dev/sda (system disk).
+--zap-ceph	Run ceph-volume lvm zap --destroy if Ceph metadata is found.
+--zap-zfs	Run zpool labelclear -f if ZFS label is found.
+all	Select all available disks.
+-<disk>	Exclude a specific disk when using all (e.g., -sda, -nvme0n1).
+pattern*	Wipe multiple disks by pattern (e.g., sd*, nvme*, vd*, mmcblk*).
+
+
+## 🛠 How it works
+Detect target disks using lsblk.
+Skip unsafe devices (system / loop / sr / dm).
+For each disk:
+Print metadata (blkid, LVM, RAID, ZFS).
+Confirm wipe (manual mode) or auto proceed.
+Run wipefs -a and sgdisk --zap-all.
+Optionally run Ceph or ZFS cleanup.
+Reload disk partition table.
+Log every step with colored output.
+
+
+## 📜 License
+Free to use under MIT License
