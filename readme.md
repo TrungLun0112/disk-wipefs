@@ -7,10 +7,25 @@ git clone https://github.com/TrungLun0112/disk-wipefs.git
 cd disk-wipefs
 chmod +x disk-wipefs.sh
 
-Cách sử dụng:
-./disk-wipefs.sh <start_letter> [end_letter] [--auto|--manual]
+# Wipe specific disks
+./disk-wipefs.sh sdb nvme0n1 vda
 
-Ví dụ: 
-./disk-wipefs.sh b d        # clean sdb to sdd, ask confirm each disk
-./disk-wipefs.sh f --auto   # clean sdf only, no confirm
+# Wipe all disks except exclusions
+./disk-wipefs.sh all -sda -nvme0n1
+
+# Pattern matching
+./disk-wipefs.sh sd* nvme* vd* mmcblk*
+
+# Auto mode (no confirmation)
+./disk-wipefs.sh --auto sdb sdc
+
+# Manual mode (default, confirm each)
+./disk-wipefs.sh --manual sdb sdc
+
+# Force wipe /dev/sda
+./disk-wipefs.sh --force sda
+
+# With Ceph/ZFS cleanup
+./disk-wipefs.sh --zap-ceph --zap-zfs nvme0n1
+
 ```
