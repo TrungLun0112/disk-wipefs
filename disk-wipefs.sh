@@ -1,125 +1,155 @@
 #!/usr/bin/env bash
 #
-# disk-wipefs.sh - Safe disk wiping script using wipefs
-#
-# Author: ChatGPT & TrungLun0112
-# Repo:   https://github.com/TrungLun0112
-#
-# This script safely wipes partition/signature info from disks.
-# It auto-installs required dependencies to ensure smooth execution
-# across most Linux distributions.
+# disk-wipefs.sh - Powerful disk wipe helper for Linux
+# Credits: ChatGPT & TrungLun0112
+# Repo: https://github.com/TrungLun0112/disk-wipefs
 #
 
-set -euo pipefail
+#######################################
+# CONFIG: Colors for logs
+#######################################
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[1;34m"
+RESET="\033[0m"
 
-# ========== CONFIG ==========
-REQUIRED_PKGS=(gdisk mdadm lvm2 kpartx)
-SKIP_DEFAULT="/dev/sda"
+#######################################
+# Trap Ctrl+C
+#######################################
+trap 'echo -e "${RED}[ABORT]${RESET} Script interrupted by user (Ctrl+C). Exiting..."; exit 130' INT
 
-# ========== FUNCTIONS ==========
+#######################################
+# Logging functions
+#######################################
+log_info()    { echo -e "${BLUE}[INFO]${RESET} $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+log_error()   { echo -e "${RED}[ERROR]${RESET} $*"; }
+log_success() { echo -e "${GREEN}[OK]${RESET} $*"; }
+log_check()   { echo -e "${YELLOW}[CHECK]${RESET} $*"; }
+log_step()    { echo -e "${GREEN}[STEP]${RESET} $*"; }
 
-log() { echo -e "[INFO] $*"; }
-err() { echo -e "[ERROR] $*" >&2; }
-
-detect_distro() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        DISTRO=$ID
-    else
-        DISTRO="unknown"
+#######################################
+# Fix invalid cdrom repository (Ubuntu/Debian)
+#######################################
+fix_cdrom_repo() {
+    if [ -f /etc/apt/sources.list ]; then
+        if grep -q "cdrom" /etc/apt/sources.list; then
+            log_warn "Found invalid 'cdrom' repository. Fixing..."
+            sudo sed -i 's|^deb cdrom|#deb cdrom|' /etc/apt/sources.list
+            sudo sed -i 's|^deb \[.*\] file:/cdrom|#deb [check-date=no] file:/cdrom|' /etc/apt/sources.list
+            log_info "Disabled cdrom repository. Running apt update..."
+            sudo apt-get update -y || true
+        else
+            log_info "No cdrom repo found."
+        fi
     fi
-    echo "$DISTRO"
 }
 
-install_packages() {
-    local distro pkgmgr
+#######################################
+# Check and install missing dependencies
+#######################################
+install_deps() {
+    log_step "Checking required tools..."
+    PKGS=("util-linux" "mdadm" "lvm2" "parted" "kpartx" "scsitools" "zfsutils-linux" "ceph-volume")
+    MISSING=()
 
-    distro=$(detect_distro)
-    log "Detected distro: $distro"
+    for pkg in "${PKGS[@]}"; do
+        if ! command -v wipefs >/dev/null 2>&1 && [ "$pkg" = "util-linux" ]; then
+            MISSING+=("util-linux")
+        elif ! dpkg -s "$pkg" >/dev/null 2>&1 2>/dev/null; then
+            MISSING+=("$pkg")
+        fi
+    done
 
-    case "$distro" in
-        ubuntu|debian)
-            pkgmgr="apt"
-            sudo apt update -y
-            for p in "${REQUIRED_PKGS[@]}"; do
-                log "Installing $p..."
-                sudo apt install -y "$p" || true
-            done
-            ;;
-        centos|rhel|rocky|almalinux)
-            pkgmgr="yum"
-            for p in "${REQUIRED_PKGS[@]}"; do
-                log "Installing $p..."
-                sudo yum install -y "$p" || true
-            done
-            ;;
-        fedora)
-            pkgmgr="dnf"
-            for p in "${REQUIRED_PKGS[@]}"; do
-                log "Installing $p..."
-                sudo dnf install -y "$p" || true
-            done
-            ;;
-        opensuse*|sles)
-            pkgmgr="zypper"
-            log "Refreshing repo..."
-            sudo zypper refresh
-            log "Installing required packages..."
-            sudo zypper install -y gptfdisk mdadm lvm2 multipath-tools || true
-            ;;
-        arch)
-            pkgmgr="pacman"
-            sudo pacman -Sy --noconfirm gptfdisk mdadm lvm2 multipath-tools || true
-            ;;
-        alpine)
-            pkgmgr="apk"
-            for p in gptfdisk mdadm lvm2 multipath-tools; do
-                log "Installing $p..."
-                sudo apk add "$p" || true
-            done
-            ;;
-        *)
-            err "Unsupported distro: $distro"
-            err "Please manually install: ${REQUIRED_PKGS[*]}"
-            ;;
-    esac
+    if [ ${#MISSING[@]} -gt 0 ]; then
+        log_warn "Missing packages: ${MISSING[*]}"
+        log_info "Script will auto install missing packages..."
+        for pkg in "${MISSING[@]}"; do
+            log_info "Installing $pkg..."
+            sudo apt-get install -y "$pkg" || true
+        done
+    else
+        log_success "All required tools already installed."
+    fi
 }
 
-list_disks() {
-    lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'
+#######################################
+# Reload disk changes
+#######################################
+reload_disks() {
+    local disk=$1
+    log_check "Reloading disk tables for $disk"
+    sudo partprobe "$disk" || true
+    sudo blockdev --rereadpt "$disk" || true
+    sudo kpartx -u "$disk" || true
+    for host in /sys/class/scsi_host/host*; do
+        echo "- - -" | sudo tee "$host/scan" >/dev/null
+    done
+    log_success "Reload complete for $disk"
 }
 
+#######################################
+# Wipe a single disk
+#######################################
 wipe_disk() {
-    local disk="$1"
-
-    if [[ "$disk" == "$SKIP_DEFAULT" && "${FORCE:-0}" -ne 1 ]]; then
-        log "Skipping $disk (default protection). Use --force to override."
+    local disk=$1
+    if [[ "$disk" == "/dev/sda" && "$FORCE" != "1" ]]; then
+        log_warn "Skipping $disk (system disk). Use --force to override."
         return
     fi
 
-    log "Wiping signatures on $disk..."
-    sudo wipefs -a -f "$disk"
-
-    log "Reloading partition table for $disk..."
-    sudo partprobe "$disk" || sudo udevadm trigger --subsystem-match=block
+    log_step "Wiping $disk"
+    sudo wipefs -a "$disk"
+    sudo sgdisk --zap-all "$disk" || true
+    sudo dd if=/dev/zero of="$disk" bs=1M count=10 oflag=direct,dsync status=none || true
+    reload_disks "$disk"
+    log_success "Disk $disk wiped successfully."
 }
 
-# ========== MAIN ==========
-
+#######################################
+# Main
+#######################################
 FORCE=0
-if [[ "${1:-}" == "--force" ]]; then
-    FORCE=1
-fi
+MODE="ask"
+DISKS=()
 
-log "Checking and installing required packages..."
-install_packages
-
-log "Listing available disks..."
-DISKS=$(list_disks)
-echo "$DISKS"
-
-for d in $DISKS; do
-    wipe_disk "$d"
+# Parse args
+for arg in "$@"; do
+    case $arg in
+        --auto) MODE="auto"; shift ;;
+        --manual) MODE="ask"; shift ;;
+        --force) FORCE=1; shift ;;
+        all) DISKS+=("all"); shift ;;
+        *) DISKS+=("$arg"); shift ;;
+    esac
 done
 
-log "Done. All eligible disks have been wiped."
+# Fix cdrom repo first
+fix_cdrom_repo
+
+# Install deps
+install_deps
+
+# Build disk list
+if [[ " ${DISKS[*]} " =~ " all " ]]; then
+    log_step "Detecting all available disks..."
+    MAP=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}')
+    DISKS=($MAP)
+    log_info "Disks found: ${DISKS[*]}"
+fi
+
+# Run wiping
+for disk in "${DISKS[@]}"; do
+    if [ "$MODE" = "ask" ]; then
+        read -rp "Do you want to wipe $disk? (y/n): " yn
+        case $yn in
+            [Yy]*) wipe_disk "$disk" ;;
+            *) log_info "Skipping $disk" ;;
+        esac
+    else
+        wipe_disk "$disk"
+    fi
+done
+
+log_success "All tasks completed."
