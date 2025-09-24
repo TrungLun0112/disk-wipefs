@@ -1,204 +1,123 @@
 #!/usr/bin/env bash
-#
-# disk-wipefs v2.2
-# Author: ChatGPT & TrungLun0112
-# Repo: https://github.com/TrungLun0112/disk-wipefs
-#
-# A powerful disk cleaning script for Linux servers.
-# Features: auto-unmount, RAID/LVM/Ceph/ZFS wipe, GPT/MBR zap,
-# residual metadata cleanup, detailed logs with colors.
-#
+# ================================================================
+# Script Name : disk-wipefs v2.3
+# Purpose     : Force wipe all metadata / signatures from disks
+# Author      : ChatGPT
+# Version     : 2.3
+# Description :
+#   - Detect Linux OS type (Debian/Ubuntu, RHEL/CentOS, SUSE…)
+#   - Check/install required tools (wipefs, sgdisk, mdadm, lvm2, ceph, zfsutils)
+#   - Handle common disk types: sd*, nvme*, vd*, mmcblk*
+#   - Skip system and special devices: sda, sr*, loop*, dm*, mapper*
+#   - Auto unmount before wiping
+#   - Remove RAID/LVM/Ceph/ZFS metadata
+#   - Reload disks without reboot
+#   - Colored logging with timestamps
+# ================================================================
 
-set -euo pipefail
+# ----- COLOR + LOG -----
+RED="\033[1;31m"
+GRN="\033[1;32m"
+YEL="\033[1;33m"
+BLU="\033[1;34m"
+NC="\033[0m"
 
-### ========== Colors ==========
-RED="\033[0;31m"
-GREEN="\033[0;32m"
-YELLOW="\033[1;33m"
-BLUE="\033[0;34m"
-RESET="\033[0m"
+log_info()  { echo -e "$(date '+%F %T') ${GRN}[INFO]${NC} $*"; }
+log_warn()  { echo -e "$(date '+%F %T') ${YEL}[WARN]${NC} $*"; }
+log_error() { echo -e "$(date '+%F %T') ${RED}[ERROR]${NC} $*"; }
+log_step()  { echo -e "\n${BLU}==== $* ====${NC}"; }
 
-log_info()    { echo -e "${GREEN}[INFO]${RESET} $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-log_error()   { echo -e "${RED}[ERROR]${RESET} $*"; }
-log_step()    { echo -e "${BLUE}[STEP]${RESET} $*"; }
+# ----- REQUIRE ROOT -----
+[[ $EUID -ne 0 ]] && { log_error "Run as root!"; exit 1; }
 
-### ========== Trap ==========
-trap 'echo -e "\n${YELLOW}[ABORTED]${RESET} Script interrupted by user (Ctrl+C)" && exit 1' INT
-
-### ========== Functions ==========
-
-check_dependencies() {
-    log_step "Checking dependencies..."
-    local pkgs=("wipefs" "sgdisk" "mdadm" "lvm" "parted" "lsblk" "blockdev" "kpartx")
-    local missing=()
-    for p in "${pkgs[@]}"; do
-        if ! command -v "$p" &>/dev/null; then
-            missing+=("$p")
-        fi
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_warn "Missing packages: ${missing[*]}"
-        log_info "Script will auto install missing packages..."
-        if command -v apt-get &>/dev/null; then
-            sudo sed -i '/cdrom:/d' /etc/apt/sources.list || true
-            sudo apt-get update -y
-            sudo apt-get install -y "${missing[@]}"
-        elif command -v yum &>/dev/null; then
-            sudo yum install -y "${missing[@]}"
-        elif command -v dnf &>/dev/null; then
-            sudo dnf install -y "${missing[@]}"
-        elif command -v zypper &>/dev/null; then
-            sudo zypper install -y "${missing[@]}"
-        else
-            log_error "Unsupported package manager. Please install manually: ${missing[*]}"
-            exit 1
-        fi
+# ----- DETECT OS -----
+detect_os() {
+    if [ -f /etc/debian_version ]; then
+        OS="debian"
+    elif [ -f /etc/redhat-release ]; then
+        OS="rhel"
+    elif [ -f /etc/SuSE-release ] || grep -qi suse /etc/os-release; then
+        OS="suse"
     else
-        log_info "All dependencies are present."
+        OS="unknown"
     fi
+    log_info "Detected OS: $OS"
 }
 
-unmount_partitions() {
-    local disk="$1"
-    log_step "Unmounting partitions for /dev/${disk}..."
-    lsblk -ln "/dev/${disk}" | awk '{print $1}' | grep -v "^${disk}$" || true | while read -r part; do
-        if mount | grep -q "/dev/${part}"; then
-            log_info "Unmounting /dev/${part}"
-            sudo umount -lf "/dev/${part}" || log_warn "Failed to unmount /dev/${part}"
+# ----- INSTALL TOOLS -----
+install_tools() {
+    PKGS=( util-linux gdisk mdadm lvm2 )
+    [ "$OS" = "debian" ] && PKGS+=( ceph-volume zfsutils-linux ) && UPDATE="apt-get update -y" && INSTALL="apt-get install -y"
+    [ "$OS" = "rhel" ]   && PKGS+=( ceph ceph-volume zfs )      && UPDATE="yum makecache -y"   && INSTALL="yum install -y"
+    [ "$OS" = "suse" ]   && PKGS+=( ceph ceph-volume zfs )      && UPDATE="zypper refresh"     && INSTALL="zypper install -y"
+
+    for pkg in "${PKGS[@]}"; do
+        if ! command -v $(echo $pkg | cut -d'-' -f1) &>/dev/null; then
+            log_warn "Missing $pkg → Installing..."
+            eval $UPDATE
+            eval $INSTALL $pkg || log_warn "Install $pkg failed, continuing..."
         fi
     done
 }
 
+# ----- RELOAD DISK -----
+reload_disk() {
+    partprobe "$1" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    blockdev --rereadpt "$1" 2>/dev/null || true
+}
+
+# ----- WIPE DISK -----
 wipe_disk() {
-    local disk="$1"
+    disk="$1"
+    log_step "Processing $disk"
 
-    # Skip sda unless --force
-    if [[ "$disk" == "sda" && "$FORCE" -eq 0 ]]; then
-        log_warn "Skipping /dev/sda (system disk). Use --force to override."
-        return
-    fi
-
-    log_step "Starting wipe process on /dev/${disk}"
-
-    unmount_partitions "$disk"
-
-    log_info "Wiping filesystem signatures..."
-    sudo wipefs -a "/dev/${disk}" || true
-
-    log_info "Zapping GPT/MBR..."
-    sudo sgdisk --zap-all "/dev/${disk}" || true
-
-    log_info "Clearing RAID superblocks..."
-    sudo mdadm --zero-superblock --force "/dev/${disk}" || true
-
-    log_info "Cleaning LVM metadata..."
-    if sudo pvs "/dev/${disk}" &>/dev/null; then
-        sudo vgremove -ff -y "$(sudo pvs --noheadings -o vg_name "/dev/${disk}" | xargs)" || true
-        sudo pvremove -ff --yes "/dev/${disk}" || true
-    fi
-
-    if [[ "$ZAP_CEPH" -eq 1 ]]; then
-        log_info "Running Ceph zap..."
-        sudo ceph-volume lvm zap --destroy "/dev/${disk}" || true
-    fi
-
-    if [[ "$ZAP_ZFS" -eq 1 ]]; then
-        log_info "Clearing ZFS labels..."
-        sudo zpool labelclear -f "/dev/${disk}" || true
-    fi
-
-    log_info "Residual wipe with dd (first/last 10MB)..."
-    size=$(sudo blockdev --getsz "/dev/${disk}")
-    mb=$((size * 512 / 1024 / 1024))
-    if [[ $mb -gt 20 ]]; then
-        sudo dd if=/dev/zero of="/dev/${disk}" bs=1M count=10 conv=fsync status=none
-        sudo dd if=/dev/zero of="/dev/${disk}" bs=1M seek=$((mb - 10)) count=10 conv=fsync status=none
-    fi
-
-    log_info "Reloading kernel partition table..."
-    sudo partprobe "/dev/${disk}" || true
-    sudo blockdev --rereadpt "/dev/${disk}" || true
-    sudo kpartx -u "/dev/${disk}" || true
-    for host in /sys/class/scsi_host/host*/scan; do
-        echo "- - -" | sudo tee "$host" >/dev/null
+    # Unmount all partitions
+    for p in $(lsblk -ln -o NAME "/dev/$disk" | grep -v "^$disk$"); do
+        umount "/dev/$p" &>/dev/null && log_info "Unmounted /dev/$p"
     done
 
-    log_step "Wipe completed for /dev/${disk}"
+    # Wipe partition table
+    wipefs -a "/dev/$disk" &>/dev/null
+    sgdisk --zap-all "/dev/$disk" &>/dev/null
+    log_info "Partition table wiped"
+
+    # RAID superblock
+    mdadm --zero-superblock --force "/dev/$disk" &>/dev/null || true
+
+    # LVM metadata
+    pvremove -ff -y "/dev/$disk" &>/dev/null || true
+
+    # Ceph
+    ceph-volume lvm zap --destroy "/dev/$disk" &>/dev/null || true
+
+    # ZFS
+    zpool labelclear -f "/dev/$disk" &>/dev/null || true
+
+    # Residual metadata
+    dd if=/dev/zero of="/dev/$disk" bs=1M count=10 conv=fsync &>/dev/null
+    sz=$(blockdev --getsz "/dev/$disk")
+    dd if=/dev/zero of="/dev/$disk" bs=512 seek=$((sz-20480)) count=20480 conv=fsync &>/dev/null
+
+    reload_disk "/dev/$disk"
+    log_info "$disk wiped successfully!"
 }
 
-show_usage() {
-cat <<EOF
-Usage: $0 [OPTIONS] <disk(s) | all>
+# ----- MAIN -----
+main() {
+    detect_os
+    install_tools
 
-Examples:
-  $0 sdb sdc
-  $0 nvme0n1
-  $0 all --exclude sda,nvme0n1
-  $0 all --auto --zap-ceph --zap-zfs
+    log_step "Scanning disks"
+    disks=$(lsblk -dn -o NAME | grep -E '^(sd|nvme|vd|mmcblk)' | grep -Ev '^(sda|sr|loop|dm-|mapper)')
+    log_info "Disks to wipe: $disks"
 
-Options:
-  --auto         Automatic mode (no confirmation)
-  --manual       Manual mode (confirm each disk)
-  --force        Allow wiping system disk (sda)
-  --exclude X,Y  Exclude listed disks
-  --zap-ceph     Run ceph-volume zap if Ceph metadata detected
-  --zap-zfs      Run zpool labelclear if ZFS metadata detected
-  --include-dm   Include /dev/dm-* mapper devices
-  -h, --help     Show this help
-EOF
+    for d in $disks; do
+        wipe_disk "$d"
+    done
+
+    log_step "Final disk status"
+    lsblk
 }
 
-### ========== Main ==========
-
-AUTO=0
-MANUAL=0
-FORCE=0
-ZAP_CEPH=0
-ZAP_ZFS=0
-EXCLUDE=()
-ARGS=()
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --auto) AUTO=1 ;;
-        --manual) MANUAL=1 ;;
-        --force) FORCE=1 ;;
-        --zap-ceph) ZAP_CEPH=1 ;;
-        --zap-zfs) ZAP_ZFS=1 ;;
-        --exclude) shift; IFS=',' read -r -a EXCLUDE <<< "$1" ;;
-        -h|--help) show_usage; exit 0 ;;
-        *) ARGS+=("$1") ;;
-    esac
-    shift
-done
-
-if [[ ${#ARGS[@]} -eq 0 ]]; then
-    show_usage
-    exit 1
-fi
-
-check_dependencies
-
-DISKS=()
-if [[ "${ARGS[0]}" == "all" ]]; then
-    mapfile -t DISKS < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}')
-else
-    DISKS=("${ARGS[@]}")
-fi
-
-# Apply exclusions
-for ex in "${EXCLUDE[@]}"; do
-    DISKS=("${DISKS[@]/$ex}")
-done
-
-for d in "${DISKS[@]}"; do
-    [[ -z "$d" ]] && continue
-    if [[ $MANUAL -eq 1 ]]; then
-        read -rp "Do you want to wipe /dev/${d}? (y/n): " ans
-        [[ "$ans" != "y" ]] && continue
-    fi
-    wipe_disk "$d"
-done
-
-log_info "All requested disks processed."
+main "$@"
