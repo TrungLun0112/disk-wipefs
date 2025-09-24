@@ -30,48 +30,74 @@ log_check()   { echo -e "${YELLOW}[CHECK]${RESET} $*"; }
 log_step()    { echo -e "${GREEN}[STEP]${RESET} $*"; }
 
 #######################################
-# Fix invalid cdrom repository (Ubuntu/Debian)
+# Detect OS
+#######################################
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        VER=$VERSION_ID
+        log_info "Detected OS: $PRETTY_NAME"
+    else
+        log_warn "Cannot detect OS. Assuming Linux."
+        OS="linux"
+        VER="unknown"
+    fi
+}
+
+#######################################
+# Fix cdrom repo if needed (Debian/Ubuntu)
 #######################################
 fix_cdrom_repo() {
-    if [ -f /etc/apt/sources.list ]; then
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
         if grep -q "cdrom" /etc/apt/sources.list; then
             log_warn "Found invalid 'cdrom' repository. Fixing..."
             sudo sed -i 's|^deb cdrom|#deb cdrom|' /etc/apt/sources.list
             sudo sed -i 's|^deb \[.*\] file:/cdrom|#deb [check-date=no] file:/cdrom|' /etc/apt/sources.list
-            log_info "Disabled cdrom repository. Running apt update..."
-            sudo apt-get update -y || true
-        else
-            log_info "No cdrom repo found."
+            log_info "Disabled cdrom repo."
         fi
     fi
 }
 
 #######################################
-# Check and install missing dependencies
+# Check and install missing dependencies (only if needed)
 #######################################
-install_deps() {
-    log_step "Checking required tools..."
-    PKGS=("util-linux" "mdadm" "lvm2" "parted" "kpartx" "scsitools" "zfsutils-linux" "ceph-volume")
+check_and_install_deps() {
+    REQUIRED_TOOLS=("wipefs" "sgdisk" "partprobe" "blockdev" "kpartx")
     MISSING=()
 
-    for pkg in "${PKGS[@]}"; do
-        if ! command -v wipefs >/dev/null 2>&1 && [ "$pkg" = "util-linux" ]; then
-            MISSING+=("util-linux")
-        elif ! dpkg -s "$pkg" >/dev/null 2>&1 2>/dev/null; then
-            MISSING+=("$pkg")
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            MISSING+=("$tool")
         fi
     done
 
-    if [ ${#MISSING[@]} -gt 0 ]; then
-        log_warn "Missing packages: ${MISSING[*]}"
-        log_info "Script will auto install missing packages..."
-        for pkg in "${MISSING[@]}"; do
-            log_info "Installing $pkg..."
-            sudo apt-get install -y "$pkg" || true
-        done
-    else
-        log_success "All required tools already installed."
+    if [ ${#MISSING[@]} -eq 0 ]; then
+        log_success "All required tools are present."
+        return
     fi
+
+    log_warn "Missing tools: ${MISSING[*]}"
+    log_info "Will attempt to install missing tools."
+
+    # Fix repo only if we need to install
+    fix_cdrom_repo
+
+    case $OS in
+        ubuntu|debian)
+            sudo apt-get update -y
+            sudo apt-get install -y util-linux gdisk parted kpartx
+            ;;
+        centos|rhel|almalinux|rocky)
+            sudo yum install -y util-linux gdisk parted kpartx
+            ;;
+        fedora)
+            sudo dnf install -y util-linux gdisk parted kpartx
+            ;;
+        *)
+            log_warn "Unknown OS: please install missing tools manually."
+            ;;
+    esac
 }
 
 #######################################
@@ -125,11 +151,8 @@ for arg in "$@"; do
     esac
 done
 
-# Fix cdrom repo first
-fix_cdrom_repo
-
-# Install deps
-install_deps
+detect_os
+check_and_install_deps
 
 # Build disk list
 if [[ " ${DISKS[*]} " =~ " all " ]]; then
