@@ -195,20 +195,20 @@ is_tool_installed() {
 check_required_tools() {
     log_step "Checking required tools..."
     
-    local missing_tools=()
+    local missing_required_tools=()
     
-    # Check required tools only (not optional ones)
+    # Check only required tools (not optional ones)
     for tool in "${REQUIRED_TOOLS[@]}"; do
         if ! is_tool_installed "$tool"; then
-            missing_tools+=("$tool")
+            missing_required_tools+=("$tool")
         fi
     done
     
-    if [ ${#missing_tools[@]} -eq 0 ]; then
+    if [ ${#missing_required_tools[@]} -eq 0 ]; then
         log_ok "All required tools are available"
         return 0
     else
-        log_warn "Missing required tools: ${missing_tools[*]}"
+        log_warn "Missing required tools: ${missing_required_tools[*]}"
         return 1
     fi
 }
@@ -318,28 +318,50 @@ install_missing_tools() {
     return 0
 }
 
-# Get list of available disks
+# Get list of available disks (whole disks only, no partitions)
 get_available_disks() {
     local disks=()
     
-    # Find disks matching supported patterns: sd*, nvme*, vd*, mmcblk*
-    for disk in /dev/sd* /dev/nvme*n* /dev/vd* /dev/mmcblk*; do
+    # Find whole disks only (not partitions)
+    # sd* pattern: sda, sdb, sdc... (not sda1, sda2...)
+    for disk in /dev/sd[a-z]; do
         if [ -b "$disk" ]; then
             disk_name=$(basename "$disk")
-            # Skip excluded patterns by default
-            if [[ "$disk_name" =~ ^sr[0-9]*$ ]] || \
-               [[ "$disk_name" =~ ^dm-[0-9]*$ ]] || \
-               [[ "$disk_name" =~ ^loop[0-9]*$ ]] || \
-               [[ "$disk_name" =~ mapper ]]; then
-                continue
-            fi
-            
             # Skip sda unless --force is used
             if [[ "$disk_name" == "sda" ]] && [[ "$FORCE_SDA" != true ]]; then
                 continue
             fi
-            
             disks+=("$disk_name")
+        fi
+    done 2>/dev/null
+    
+    # nvme* pattern: nvme0n1, nvme1n1... (not nvme0n1p1, nvme0n1p2...)
+    for disk in /dev/nvme[0-9]*n[0-9]*; do
+        if [ -b "$disk" ]; then
+            disk_name=$(basename "$disk")
+            # Make sure it's not a partition (nvme*n*p*)
+            if [[ ! "$disk_name" =~ p[0-9]+$ ]]; then
+                disks+=("$disk_name")
+            fi
+        fi
+    done 2>/dev/null
+    
+    # vd* pattern: vda, vdb, vdc... (not vda1, vda2...)
+    for disk in /dev/vd[a-z]; do
+        if [ -b "$disk" ]; then
+            disk_name=$(basename "$disk")
+            disks+=("$disk_name")
+        fi
+    done 2>/dev/null
+    
+    # mmcblk* pattern: mmcblk0, mmcblk1... (not mmcblk0p1, mmcblk0p2...)
+    for disk in /dev/mmcblk[0-9]*; do
+        if [ -b "$disk" ]; then
+            disk_name=$(basename "$disk")
+            # Make sure it's not a partition (mmcblk*p*)
+            if [[ ! "$disk_name" =~ p[0-9]+$ ]]; then
+                disks+=("$disk_name")
+            fi
         fi
     done 2>/dev/null
     
@@ -362,41 +384,52 @@ is_excluded() {
     return 1
 }
 
-# Expand wildcard patterns
+# Expand wildcard patterns (whole disks only, no partitions)
 expand_pattern() {
     local pattern="$1"
     local expanded=()
     
     case "$pattern" in
         sd*)
-            for disk in /dev/sd*; do
+            # Only whole disks: sdb, sdc... not sdb1, sdc1...
+            for disk in /dev/sd[a-z]; do
                 if [ -b "$disk" ]; then
                     disk_name=$(basename "$disk")
-                    if [[ ! "$disk_name" =~ ^sr[0-9]*$ ]]; then
+                    # Skip sda unless --force is used
+                    if [[ "$disk_name" == "sda" ]] && [[ "$FORCE_SDA" != true ]]; then
+                        continue
+                    fi
+                    expanded+=("$disk_name")
+                fi
+            done
+            ;;
+        nvme*)
+            # Only whole disks: nvme0n1, nvme1n1... not nvme0n1p1, nvme1n1p1...
+            for disk in /dev/nvme[0-9]*n[0-9]*; do
+                if [ -b "$disk" ]; then
+                    disk_name=$(basename "$disk")
+                    # Make sure it's not a partition (nvme*n*p*)
+                    if [[ ! "$disk_name" =~ p[0-9]+$ ]]; then
                         expanded+=("$disk_name")
                     fi
                 fi
             done
             ;;
-        nvme*)
-            for disk in /dev/nvme*n*; do
-                if [ -b "$disk" ]; then
-                    expanded+=($(basename "$disk"))
-                fi
-            done
-            ;;
         vd*)
-            for disk in /dev/vd*; do
+            # Only whole disks: vdb, vdc... not vdb1, vdc1...
+            for disk in /dev/vd[a-z]; do
                 if [ -b "$disk" ]; then
                     expanded+=($(basename "$disk"))
                 fi
             done
             ;;
         mmcblk*)
-            for disk in /dev/mmcblk*; do
+            # Only whole disks: mmcblk0, mmcblk1... not mmcblk0p1, mmcblk1p1...
+            for disk in /dev/mmcblk[0-9]*; do
                 if [ -b "$disk" ]; then
                     disk_name=$(basename "$disk")
-                    if [[ ! "$disk_name" =~ p[0-9]*$ ]]; then  # Exclude partitions
+                    # Make sure it's not a partition (mmcblk*p*)
+                    if [[ ! "$disk_name" =~ p[0-9]+$ ]]; then
                         expanded+=("$disk_name")
                     fi
                 fi
@@ -404,7 +437,11 @@ expand_pattern() {
             ;;
         *)
             if [ -b "/dev/$pattern" ]; then
-                expanded+=("$pattern")
+                # Check if it's a whole disk (not a partition)
+                disk_name="$pattern"
+                if [[ ! "$disk_name" =~ [0-9]+$ ]] && [[ ! "$disk_name" =~ p[0-9]+$ ]]; then
+                    expanded+=("$pattern")
+                fi
             fi
             ;;
     esac
@@ -731,9 +768,16 @@ main() {
     
     log_info "Starting disk wipe script..."
     
-    # Detect OS and install missing tools
+    # Detect OS first
     detect_os || exit 1
-    install_missing_tools || exit 1
+    
+    # Check if required tools are available
+    if check_required_tools; then
+        log_info "All required tools available, proceeding with disk wipe..."
+    else
+        log_info "Missing required tools, installing dependencies..."
+        install_missing_tools || exit 1
+    fi
     
     # Determine target disks
     local final_disks=()
