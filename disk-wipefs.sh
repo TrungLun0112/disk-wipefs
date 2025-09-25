@@ -1,173 +1,98 @@
 #!/usr/bin/env bash
-# ==========================================================
-# disk-wipefs v7.0
+# disk-wipefs.sh v7.1
+# Purpose: Wipe disk sạch sẽ, chỉ target disk được chỉ định
 # Credits: ChatGPT & TrungLun0112
-# Mục tiêu: Wipe sạch sẽ disk được chỉ định, không tự động
-# ==========================================================
 
 set -euo pipefail
-IFS=$'\n\t'
 
-VERSION="v7.0"
+VERSION="7.1"
+LOG_PREFIX="$(date '+%Y-%m-%d %H:%M:%S') [INFO]"
 
-# Màu log
-C_INFO="\033[1;34m"
-C_OK="\033[1;32m"
-C_WARN="\033[1;33m"
-C_ERR="\033[1;31m"
-C_RST="\033[0m"
+# ===== Helpers =====
+info()  { echo "${LOG_PREFIX} $*"; }
+ok()    { echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] $*"; }
+err()   { echo "$(date '+%Y-%m-%d %H:%M:%S') [ERR] $*" >&2; exit 1; }
 
-log()   { echo -e "$(date '+%F %T') ${C_INFO}[INFO]${C_RST} $*"; }
-ok()    { echo -e "$(date '+%F %T') ${C_OK}[OK]${C_RST} $*"; }
-warn()  { echo -e "$(date '+%F %T') ${C_WARN}[WARN]${C_RST} $*"; }
-error() { echo -e "$(date '+%F %T') ${C_ERR}[ERR]${C_RST} $*" >&2; }
-
-require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        error "Script phải chạy với quyền root"
-        exit 1
-    fi
+# ===== Usage =====
+usage() {
+  echo "Usage: $0 <disk> (ví dụ: $0 sdb)"
+  exit 1
 }
 
-# ==========================================================
-# Detect OS
-# ==========================================================
-detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS_PRETTY=$PRETTY_NAME
-        OS_ID=$ID
-        log "Detected OS: $OS_PRETTY"
-    else
-        OS_ID="unknown"
-        warn "Không xác định được OS"
-    fi
-}
+# ===== Main =====
+[ $# -ne 1 ] && usage
+DISK="$1"
+TARGET="/dev/${DISK}"
 
-# ==========================================================
-# Check tool
-# ==========================================================
-check_tools() {
-    local essential=(wipefs sgdisk partprobe blockdev lsblk dd)
-    local missing=()
-    for t in "${essential[@]}"; do
-        if ! command -v "$t" >/dev/null 2>&1; then
-            missing+=("$t")
-        fi
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        error "Thiếu tool: ${missing[*]}"
-        case "$OS_ID" in
-            ubuntu|debian)
-                apt-get update -y
-                apt-get install -y "${missing[@]}"
-                ;;
-            centos|rhel|rocky|almalinux)
-                yum install -y "${missing[@]}"
-                ;;
-            *)
-                error "Không biết cách cài tool trên OS này"
-                exit 1
-                ;;
-        esac
-    else
-        ok "All essential tools present"
-    fi
-}
+info "disk-wipefs v${VERSION} starting"
+info "Credits: ChatGPT & TrungLun0112"
 
-# ==========================================================
-# Validate input
-# ==========================================================
-validate_target() {
-    local tgt="$1"
-    if [[ ! -b /dev/$tgt ]]; then
-        error "Target /dev/$tgt không tồn tại"
-        exit 1
-    fi
-    case "$tgt" in
-        sda|sr*|dm*|loop*|mapper/*)
-            error "Target /dev/$tgt bị block (system/optical/virtual)"
-            exit 1
-            ;;
-    esac
-    ok "Target /dev/$tgt hợp lệ"
-}
+# Check OS
+OS=$(lsb_release -d 2>/dev/null | awk -F"\t" '{print $2}')
+info "Detected OS: ${OS:-Unknown}"
 
-# ==========================================================
-# Pre-clean: unmount, swapoff, deactivate LVM/RAID
-# ==========================================================
-preclean() {
-    local dev="$1"
-    log "Unmount partitions của $dev ..."
-    umount -fl "/dev/${dev}"* 2>/dev/null || true
+# Check tools
+for t in lsblk umount swapoff wipefs sgdisk dd blkdiscard pvs vgs vgchange mdadm zpool multipath; do
+    command -v $t >/dev/null 2>&1 || err "Thiếu tool: $t"
+done
+ok "All essential tools present"
 
-    log "Tắt swap liên quan $dev ..."
-    swapoff "/dev/${dev}"* 2>/dev/null || true
+# Validate disk
+[ ! -b "$TARGET" ] && err "Disk $TARGET không tồn tại hoặc không hợp lệ"
+ok "Target $TARGET hợp lệ"
 
-    log "Deactivate LVM ..."
-    vgchange -an 2>/dev/null || true
-    lvremove -fy "/dev/${dev}"* 2>/dev/null || true
-    pvremove -ff -y "/dev/${dev}"* 2>/dev/null || true
+# 1. Unmount partitions thuộc target
+info "Unmount partitions của $DISK ..."
+mount | grep "^/dev/${DISK}" | awk '{print $1}' | xargs -r umount -f
 
-    log "Zero RAID superblock ..."
-    mdadm --zero-superblock --force "/dev/$dev" 2>/dev/null || true
+# 2. Tắt swap trên target
+info "Tắt swap liên quan $DISK ..."
+swapoff ${TARGET}?* 2>/dev/null || true
 
-    log "Flush multipath ..."
-    multipath -f "/dev/$dev" 2>/dev/null || true
-}
+# 3. Deactivate LVM chỉ target
+info "Deactivate LVM trên $DISK ..."
+for pv in $(pvs --noheadings -o pv_name 2>/dev/null | grep "^/dev/${DISK}"); do
+    vg=$(pvs --noheadings -o vg_name $pv 2>/dev/null | xargs)
+    [ -n "$vg" ] && vgchange -an "$vg"
+    wipefs -a -f "$pv" || true
+done
 
-# ==========================================================
-# Wipe disk
-# ==========================================================
-wipe_disk() {
-    local dev="$1"
-    log "Running wipefs ..."
-    wipefs -a -f "/dev/$dev" || true
+# 4. mdadm superblock chỉ target
+info "Zero RAID superblock trên $DISK ..."
+mdadm --zero-superblock ${TARGET}?* 2>/dev/null || true
 
-    log "Zap GPT/MBR ..."
-    sgdisk --zap-all "/dev/$dev" || true
+# 5. ZFS labelclear chỉ target
+info "Clear ZFS label trên $DISK ..."
+for part in $(ls ${TARGET}?* 2>/dev/null || true); do
+    zpool labelclear -f "$part" 2>/dev/null || true
+done
 
-    log "Zero head & tail ..."
-    local size; size=$(blockdev --getsz "/dev/$dev")
-    local sector; sector=$(blockdev --getss "/dev/$dev")
-    dd if=/dev/zero of="/dev/$dev" bs=1M count=10 conv=fdatasync >/dev/null 2>&1 || true
-    dd if=/dev/zero of="/dev/$dev" bs="$sector" seek=$((size-10240)) count=10240 conv=fdatasync >/dev/null 2>&1 || true
+# 6. Multipath flush nếu có target
+info "Flush multipath trên $DISK ..."
+for mp in $(multipath -ll 2>/dev/null | grep "/dev/${DISK}" | awk '{print $1}'); do
+    multipath -f "$mp" || true
+done
 
-    log "Discard blocks (nếu hỗ trợ) ..."
-    blkdiscard "/dev/$dev" 2>/dev/null || true
+# 7. wipefs
+info "Running wipefs ..."
+wipefs -a -f "$TARGET"
 
-    log "Reload kernel view ..."
-    partprobe "/dev/$dev" || true
-    udevadm settle || true
-    ok "Disk /dev/$dev wiped sạch sẽ"
-}
+# 8. Zap GPT/MBR
+info "Zap GPT/MBR ..."
+sgdisk --zap-all "$TARGET" || true
 
-# ==========================================================
-# Main
-# ==========================================================
-require_root
-log "disk-wipefs $VERSION starting"
-log "Credits: ChatGPT & TrungLun0112"
+# 9. Zero head & tail
+info "Zero head & tail ..."
+dd if=/dev/zero of="$TARGET" bs=1M count=10 conv=fsync status=none
+dd if=/dev/zero of="$TARGET" bs=1M count=10 seek=$(( $(blockdev --getsz "$TARGET") / 2048 - 10 )) conv=fsync status=none || true
 
-detect_os
-check_tools
+# 10. Discard blocks (nếu hỗ trợ)
+info "Discard blocks (nếu hỗ trợ) ..."
+blkdiscard "$TARGET" 2>/dev/null || true
 
-if [[ $# -lt 1 ]]; then
-    error "Usage: $0 <disk> | --all"
-    exit 1
-fi
+# 11. Reload kernel view
+info "Reload kernel view ..."
+partprobe "$TARGET" 2>/dev/null || true
 
-if [[ "$1" == "--all" ]]; then
-    for d in $(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}' | grep -v -E '^(sda|sr|dm|loop|mapper)'); do
-        validate_target "$d"
-        preclean "$d"
-        wipe_disk "$d"
-    done
-else
-    tgt="$1"
-    validate_target "$tgt"
-    preclean "$tgt"
-    wipe_disk "$tgt"
-fi
-
+ok "Disk $TARGET wiped sạch sẽ"
 ok "Wipe completed. Run 'lsblk' để verify."
