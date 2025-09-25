@@ -1,309 +1,463 @@
 #!/bin/bash
 set -euo pipefail
 
-# Colors for logging
+# Color codes for logging
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Logging function
-log() {
-    local level=$1
-    local message=$2
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    case $level in
-        "INFO")  echo -e "${BLUE}[INFO] ${timestamp}: ${message}${NC}" ;;
-        "WARN")  echo -e "${YELLOW}[WARN] ${timestamp}: ${message}${NC}" ;;
-        "ERROR") echo -e "${RED}[ERROR] ${timestamp}: ${message}${NC}" ;;
-        "OK")    echo -e "${GREEN}[OK] ${timestamp}: ${message}${NC}" ;;
-    esac
-}
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
+log_ok() { echo -e "${GREEN}[OK]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
-# Check if running as root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log "ERROR" "This script must be run as root (use sudo)."
-        exit 1
-    fi
-}
+# Default excluded disks (always excluded unless --force is used)
+DEFAULT_EXCLUDED=("sda" "sr*" "dm*" "loop*" "mapper*")
+USER_EXCLUDED=()
+TARGET_DISKS=()
+AUTO_MODE=false
+FORCE_MODE=false
+MANUAL_MODE=true
 
 # Detect OS and package manager
 detect_os() {
     if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS=$ID
-        log "INFO" "Detected OS: $OS"
+        source /etc/os-release
+        case $ID in
+            ubuntu|debian)
+                OS="debian"
+                PM="apt-get"
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                OS="rhel"
+                if command -v dnf >/dev/null; then
+                    PM="dnf"
+                else
+                    PM="yum"
+                fi
+                ;;
+            opensuse*|suse)
+                OS="suse"
+                PM="zypper"
+                ;;
+            arch)
+                OS="arch"
+                PM="pacman"
+                ;;
+            *)
+                log_error "Unsupported OS: $ID"
+                exit 1
+                ;;
+        esac
+        log_info "Detected OS: $NAME ($ID)"
     else
-        log "ERROR" "Cannot detect OS. /etc/os-release not found."
+        log_error "Cannot detect OS"
         exit 1
     fi
 }
 
-# Check and install required tools
-check_install_tools() {
-    local tools=("wipefs" "sgdisk" "mdadm" "pvremove" "vgremove" "lvremove" "partprobe" "blockdev" "udevadm")
-    local missing_tools=()
-    local pkg_manager=""
-    local install_cmd=""
+# Fix CDROM source list issue on Debian/Ubuntu
+fix_cdrom_error() {
+    if [[ "$OS" == "debian" ]]; then
+        if grep -q "deb cdrom:" /etc/apt/sources.list; then
+            log_warn "Fixing CDROM source list..."
+            sed -i '/deb cdrom:/s/^/#/' /etc/apt/sources.list
+        fi
+    fi
+}
 
-    # Determine package manager
+# Install required packages
+install_dependencies() {
+    local packages=()
+    
+    # Check what's missing
+    if ! command -v wipefs >/dev/null; then packages+=("util-linux"); fi
+    if ! command -v sgdisk >/dev/null; then packages+=("gdisk"); fi
+    if ! command -v mdadm >/dev/null; then packages+=("mdadm"); fi
+    if ! command -v lvs >/dev/null; then packages+=("lvm2"); fi
+    if ! command -v ceph-volume >/dev/null; then packages+=("ceph-common"); fi
+    if ! command -v zpool >/dev/null; then packages+=("zfsutils-linux" "zfs-utils"); fi
+    if ! command -v partprobe >/dev/null; then packages+=("parted"); fi
+    if ! command -v udevadm >/dev/null; then packages+=("systemd" "udev"); fi
+
+    if [[ ${#packages[@]} -eq 0 ]]; then
+        log_ok "All required tools are available"
+        return 0
+    fi
+
+    log_warn "Installing missing packages: ${packages[*]}"
+    fix_cdrom_error
+
     case $OS in
-        ubuntu|debian)
-            pkg_manager="apt"
-            install_cmd="apt install -y"
+        debian)
+            apt-get update
+            apt-get install -y "${packages[@]}"
             ;;
-        centos|rhel|rocky|alma)
-            pkg_manager="yum"
-            install_cmd="yum install -y"
+        rhel)
+            $PM install -y "${packages[@]}"
             ;;
-        fedora)
-            pkg_manager="dnf"
-            install_cmd="dnf install -y"
-            ;;
-        suse|opensuse*)
-            pkg_manager="zypper"
-            install_cmd="zypper install -y"
+        suse)
+            zypper --non-interactive install "${packages[@]}"
             ;;
         arch)
-            pkg_manager="pacman"
-            install_cmd="pacman -S --noconfirm"
-            ;;
-        *)
-            log "ERROR" "Unsupported OS: $OS"
-            exit 1
+            pacman -Sy --noconfirm "${packages[@]}"
             ;;
     esac
 
-    # Check for missing tools
-    for tool in "${tools[@]}"; do
-        if ! command -v "$tool" &>/dev/null; then
-            missing_tools+=("$tool")
-        fi
-    done
-
-    # Check for ceph-volume and zfsutils
-    if ! command -v ceph-volume &>/dev/null; then
-        missing_tools+=("ceph-volume")
-    fi
-    if ! command -v zpool &>/dev/null; then
-        missing_tools+=("zfsutils")
-    fi
-
-    # Install missing tools
-    if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        log "INFO" "Missing tools: ${missing_tools[*]}. Installing..."
-
-        # Fix CDROM issue for apt-based systems
-        if [[ $pkg_manager == "apt" ]]; then
-            log "INFO" "Checking and fixing CDROM in /etc/apt/sources.list..."
-            sed -i '/cdrom/s/^/#/' /etc/apt/sources.list || log "WARN" "Failed to fix CDROM sources."
-            apt update || { log "ERROR" "Failed to run apt update."; exit 1; }
-        fi
-
-        # Install packages
-        case $OS in
-            ubuntu|debian)
-                $install_cmd util-linux parted mdadm lvm2 ceph zfsutils-linux
-                ;;
-            centos|rhel|rocky|alma)
-                $install_cmd util-linux parted mdadm lvm2 cephadm zfsutils
-                ;;
-            fedora)
-                $install_cmd util-linux parted mdadm lvm2 ceph zfs
-                ;;
-            suse|opensuse*)
-                $install_cmd util-linux parted mdadm lvm2 ceph zfsutils
-                ;;
-            arch)
-                $install_cmd util-linux parted mdadm lvm2 ceph zfsutils
-                ;;
-        esac
-        log "OK" "Required tools installed."
-    else
-        log "INFO" "All required tools are already installed."
-    fi
+    log_ok "Dependencies installed successfully"
 }
 
-# Wipe disk function
-wipe_disk() {
-    local disk=$1
-    log "INFO" "Processing disk: /dev/$disk"
-
-    # Unmount any partitions
-    for part in /dev/"$disk"[0-9]*; do
-        if [[ -e "$part" ]]; then
-            if mountpoint -q "$part"; then
-                log "INFO" "Unmounting $part"
-                umount "$part" || log "WARN" "Failed to unmount $part"
+# Get all available disks
+get_all_disks() {
+    local disks=()
+    local patterns=("sd*" "nvme*" "vd*" "mmcblk*")
+    
+    for pattern in "${patterns[@]}"; do
+        for disk in /dev/$pattern; do
+            if [[ -b "$disk" && ! "$disk" =~ /dev/sda$ ]]; then
+                disks+=("$(basename "$disk")")
             fi
         done
     done
-
-    # Wipe filesystem signatures
-    log "INFO" "Wiping filesystem signatures on /dev/$disk"
-    wipefs -a "/dev/$disk" || log "WARN" "Failed to wipe filesystem signatures on /dev/$disk"
-
-    # Wipe partition table
-    log "INFO" "Wiping partition table on /dev/$disk"
-    sgdisk --zap-all "/dev/$disk" || log "WARN" "Failed to wipe partition table on /dev/$disk"
-
-    # Wipe RAID superblock
-    if mdadm --examine "/dev/$disk" &>/dev/null; then
-        log "INFO" "Wiping RAID superblock on /dev/$disk"
-        mdadm --zero-superblock "/dev/$disk" || log "WARN" "Failed to wipe RAID superblock on /dev/$disk"
-    fi
-
-    # Wipe LVM metadata
-    if pvdisplay "/dev/$disk" &>/dev/null; then
-        log "INFO" "Wiping LVM metadata on /dev/$disk"
-        lvremove -f /dev/*/* || true
-        vgremove -f /dev/* || true
-        pvremove -f "/dev/$disk" || log "WARN" "Failed to wipe LVM metadata on /dev/$disk"
-    fi
-
-    # Wipe Ceph OSD
-    if ceph-volume lvm list "/dev/$disk" &>/dev/null; then
-        log "INFO" "Wiping Ceph OSD on /dev/$disk"
-        ceph-volume lvm zap --destroy "/dev/$disk" || log "WARN" "Failed to wipe Ceph OSD on /dev/$disk"
-    fi
-
-    # Wipe ZFS labels
-    if zpool import -d "/dev/$disk" &>/dev/null; then
-        log "INFO" "Wiping ZFS labels on /dev/$disk"
-        zpool labelclear -f "/dev/$disk" || log "WARN" "Failed to wipe ZFS labels on /dev/$disk"
-    fi
-
-    # Wipe residual data (10MB at start and end)
-    log "INFO" "Wiping 10MB at start and end of /dev/$disk"
-    dd if=/dev/zero of="/dev/$disk" bs=1M count=10 status=none || log "WARN" "Failed to wipe start of /dev/$disk"
-    dd if=/dev/zero of="/dev/$disk" bs=1M count=10 seek=$(( $(blockdev --getsize64 "/dev/$disk") / 1048576 - 10 )) status=none || log "WARN" "Failed to wipe end of /dev/$disk"
-
-    # Reload disk table
-    log "INFO" "Reloading disk table for /dev/$disk"
-    partprobe "/dev/$disk" || log "WARN" "Failed to run partprobe on /dev/$disk"
-    blockdev --rereadpt "/dev/$disk" || log "WARN" "Failed to run blockdev --rereadpt on /dev/$disk"
-    udevadm trigger || log "WARN" "Failed to run udevadm trigger"
-    log "OK" "Disk /dev/$disk wiped successfully."
+    
+    printf '%s\n' "${disks[@]}"
 }
 
-# Get list of disks to process
-get_disks() {
-    local pattern=$1
-    local exclude_list=$2
-    local disks=()
+# Check if disk should be excluded
+is_disk_excluded() {
+    local disk=$1
+    local exclude_list=("${DEFAULT_EXCLUDED[@]}" "${USER_EXCLUDED[@]}")
+    
+    for pattern in "${exclude_list[@]}"; do
+        if [[ "$disk" == $pattern ]]; then
+            return 0
+        fi
+    done
+    
+    return 1
+}
 
-    # Get all disks matching pattern
-    if [[ "$pattern" == "all" ]]; then
-        mapfile -t disks < <(ls /dev/{sd*,nvme*,vd*,mmcblk*} 2>/dev/null | grep -vE 'sda|sr|dm|loop|mapper' | sed 's|/dev/||')
-    else
-        mapfile -t disks < <(ls /dev/$pattern 2>/dev/null | grep -vE 'sda|sr|dm|loop|mapper' | sed 's|/dev/||')
-    fi
-
-    # Apply exclude list
-    if [[ -n "$exclude_list" ]]; then
-        local filtered_disks=()
-        IFS=',' read -ra exclude_arr <<< "$exclude_list"
-        for disk in "${disks[@]}"; do
-            local skip=false
-            for exclude in "${exclude_arr[@]}"; do
-                if [[ "$disk" == "$exclude" ]]; then
-                    skip=true
-                    break
+# Expand disk patterns (sd*, nvme*, etc.)
+expand_disk_patterns() {
+    local patterns=("$@")
+    local expanded=()
+    
+    for pattern in "${patterns[@]}"; do
+        if [[ "$pattern" == "all" ]]; then
+            mapfile -t all_disks < <(get_all_disks)
+            expanded+=("${all_disks[@]}")
+        elif [[ $pattern == *"*"* ]]; then
+            for disk in /dev/$pattern; do
+                if [[ -b "$disk" ]]; then
+                    expanded+=("$(basename "$disk")")
                 fi
             done
-            [[ "$skip" == false ]] && filtered_disks+=("$disk")
-        done
-        disks=("${filtered_disks[@]}")
-    fi
-
-    echo "${disks[@]}"
+        else
+            if [[ -b "/dev/$pattern" ]]; then
+                expanded+=("$pattern")
+            else
+                log_warn "Disk /dev/$pattern not found, skipping"
+            fi
+        fi
+    done
+    
+    # Remove duplicates
+    printf '%s\n' "${expanded[@]}" | sort -u
 }
 
-# Display help
+# Unmount any filesystems on disk
+unmount_disk() {
+    local disk=$1
+    local mounted_paths=$(lsblk -nlo MOUNTPOINT "/dev/$disk" 2>/dev/null | grep -v '^$' || true)
+    
+    if [[ -n "$mounted_paths" ]]; then
+        log_warn "Unmounting filesystems on /dev/$disk"
+        for mountpoint in $mounted_paths; do
+            umount -l "$mountpoint" 2>/dev/null || true
+        done
+    fi
+}
+
+# Remove LVM signatures
+remove_lvm() {
+    local disk=$1
+    local lvm_devices=$(pvs --noheadings -o pv_name 2>/dev/null | grep "$disk" || true)
+    
+    if [[ -n "$lvm_devices" ]]; then
+        log_warn "Removing LVM signatures from /dev/$disk"
+        pvremove -ff "/dev/$disk" 2>/dev/null || true
+        wipefs -a "/dev/$disk" 2>/dev/null || true
+    fi
+}
+
+# Remove MD RAID signatures
+remove_mdraid() {
+    local disk=$1
+    if mdadm --examine "/dev/$disk" 2>/dev/null; then
+        log_warn "Removing MD RAID signatures from /dev/$disk"
+        mdadm --zero-superblock "/dev/$disk" 2>/dev/null || true
+    fi
+}
+
+# Remove Ceph signatures
+remove_ceph() {
+    local disk=$1
+    if command -v ceph-volume >/dev/null; then
+        if ceph-volume lvm list "/dev/$disk" 2>/dev/null | grep -q "osd"; then
+            log_warn "Removing Ceph signatures from /dev/$disk"
+            ceph-volume lvm zap --destroy "/dev/$disk" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Remove ZFS signatures
+remove_zfs() {
+    local disk=$1
+    if command -v zpool >/dev/null; then
+        if zdb -l "/dev/$disk" 2>/dev/null; then
+            log_warn "Removing ZFS signatures from /dev/$disk"
+            zpool labelclear -f "/dev/$disk" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Wipe partition tables and signatures
+wipe_signatures() {
+    local disk=$1
+    log_info "Wiping all signatures from /dev/$disk"
+    
+    # First pass: wipefs
+    wipefs -a "/dev/$disk" 2>/dev/null || true
+    
+    # Second pass: sgdisk for GPT
+    sgdisk --zap-all "/dev/$disk" 2>/dev/null || true
+    
+    # Third pass: dd first 10MB
+    dd if=/dev/zero of="/dev/$disk" bs=1M count=10 status=none 2>/dev/null || true
+    
+    # Fourth pass: dd last 10MB (if disk size > 20MB)
+    local size=$(blockdev --getsize64 "/dev/$disk" 2>/dev/null || echo 0)
+    if [[ $size -gt 20971520 ]]; then
+        local seek_position=$(( (size - 10485760) / 1048576 ))
+        dd if=/dev/zero of="/dev/$disk" bs=1M seek=$seek_position status=none 2>/dev/null || true
+    fi
+}
+
+# Reload disk information
+reload_disk() {
+    local disk=$1
+    log_info "Reloading disk information for /dev/$disk"
+    
+    # Try multiple methods to reload disk
+    partprobe "/dev/$disk" 2>/dev/null || true
+    blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
+    udevadm settle --timeout=10 2>/dev/null || true
+    udevadm trigger --name-match="/dev/$disk" 2>/dev/null || true
+    
+    sleep 2
+}
+
+# Wipe a single disk
+wipe_single_disk() {
+    local disk=$1
+    
+    if [[ "$disk" == "sda" && "$FORCE_MODE" != "true" ]]; then
+        log_warn "Skipping /dev/sda (use --force to override)"
+        return 0
+    fi
+    
+    if is_disk_excluded "$disk"; then
+        log_warn "Skipping excluded disk: /dev/$disk"
+        return 0
+    fi
+    
+    # Ask for confirmation in manual mode
+    if [[ "$AUTO_MODE" == "false" ]]; then
+        read -p "Wipe /dev/$disk? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_warn "Skipping /dev/$disk"
+            return 0
+        fi
+    fi
+    
+    log_info "Starting wipe process for /dev/$disk"
+    
+    # Step 1: Unmount any filesystems
+    unmount_disk "$disk"
+    
+    # Step 2: Remove various signatures
+    remove_lvm "$disk"
+    remove_mdraid "$disk"
+    remove_ceph "$disk"
+    remove_zfs "$disk"
+    
+    # Step 3: Wipe all signatures and data
+    wipe_signatures "$disk"
+    
+    # Step 4: Reload disk information
+    reload_disk "$disk"
+    
+    log_ok "Successfully wiped /dev/$disk"
+}
+
+# Display usage information
 show_help() {
     cat << EOF
-Usage: $0 [options] [disk1 disk2 ... | pattern | all]
+Usage: $0 [OPTIONS] [DISK_PATTERNS...]
 
-Options:
-  --auto           Run automatically without confirmation for each disk.
-  --manual         Prompt for confirmation for each disk (default).
-  --all            Wipe all disks (excludes sda unless --force specified).
-  --force          Allow wiping sda (dangerous).
-  --exclude <list> Comma-separated list of disks to exclude (e.g., sda,nvme0n1).
-  --help           Show this help message.
+Wipe disk signatures and data using multiple methods.
+
+DISK_PATTERNS:
+  all                    Wipe all disks (excluding sda by default)
+  sd*                    Wipe all SCSI disks matching pattern
+  nvme*                  Wipe all NVMe disks matching pattern
+  vd*                    Wipe all VirtIO disks matching pattern
+  mmcblk*                Wipe all MMC disks matching pattern
+  sdb sdc nvme0n1        Specific disk names
+
+OPTIONS:
+  --auto                 Run automatically without confirmation
+  --manual               Ask for confirmation for each disk (default)
+  --force                Allow wiping /dev/sda and other excluded disks
+  --exclude sda,nvme0n1  Exclude specific disks from wiping
+  --help                 Show this help message
 
 Examples:
-  Wipe specific disks: sudo $0 sdb nvme0n1
-  Wipe all disks (except sda): sudo $0 all --auto
-  Wipe disks matching pattern: sudo $0 sd*
-  Wipe all disks including sda: sudo $0 all --force --auto
+  # Wipe specific disks
+  $0 sdb nvme0n1
+
+  # Wipe all disks automatically (excluding sda)
+  $0 all --auto
+
+  # Wipe all sd* disks with force
+  $0 sd* --auto --force
+
+  # Wipe all disks except sda and nvme0n1
+  $0 all --auto --exclude sda,nvme0n1
+
+WARNING: This will destroy all data on the specified disks!
 EOF
-    exit 0
+}
+
+# Parse command line arguments
+parse_arguments() {
+    local patterns=()
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --auto)
+                AUTO_MODE=true
+                MANUAL_MODE=false
+                shift
+                ;;
+            --manual)
+                MANUAL_MODE=true
+                AUTO_MODE=false
+                shift
+                ;;
+            --force)
+                FORCE_MODE=true
+                shift
+                ;;
+            --exclude)
+                if [[ -n "${2:-}" ]]; then
+                    IFS=',' read -ra USER_EXCLUDED <<< "$2"
+                    shift 2
+                else
+                    log_error "--exclude requires a comma-separated list"
+                    exit 1
+                fi
+                ;;
+            --help)
+                show_help
+                exit 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                patterns+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # If no patterns specified, show help
+    if [[ ${#patterns[@]} -eq 0 ]]; then
+        log_error "No disk patterns specified"
+        show_help
+        exit 1
+    fi
+    
+    # Expand disk patterns
+    mapfile -t TARGET_DISKS < <(expand_disk_patterns "${patterns[@]}")
+    
+    if [[ ${#TARGET_DISKS[@]} -eq 0 ]]; then
+        log_error "No valid disks found matching the patterns"
+        exit 1
+    fi
 }
 
 # Main function
 main() {
-    check_root
-    detect_os
-    check_install_tools
-
-    local mode="manual"
-    local force_sda=false
-    local exclude_list=""
-    local disks=()
-
-    # Parse arguments
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --auto) mode="auto"; shift ;;
-            --manual) mode="manual"; shift ;;
-            --force) force_sda=true; shift ;;
-            --exclude) exclude_list="$2"; shift 2 ;;
-            --help) show_help ;;
-            *) disks+=("$1"); shift ;;
-        esac
-    done
-
-    # Default to all disks if no disks or pattern specified
-    if [[ ${#disks[@]} -eq 0 ]]; then
-        disks=("all")
+    log_info "Starting disk wipe procedure"
+    
+    # Check root privileges
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        exit 1
     fi
-
-    # Process each disk or pattern
-    for pattern in "${disks[@]}"; do
-        local disk_list=($(get_disks "$pattern" "$exclude_list"))
-        if [[ ${#disk_list[@]} -eq 0 ]]; then
-            log "WARN" "No disks found matching pattern: $pattern"
-            continue
+    
+    # Detect OS and install dependencies
+    detect_os
+    install_dependencies
+    
+    # Parse command line arguments
+    parse_arguments "$@"
+    
+    log_info "Target disks: ${TARGET_DISKS[*]}"
+    log_info "Excluded disks: ${DEFAULT_EXCLUDED[*]} ${USER_EXCLUDED[*]}"
+    
+    if [[ "$FORCE_MODE" == "true" ]]; then
+        log_warn "FORCE mode enabled - /dev/sda and other excluded disks may be wiped!"
+    fi
+    
+    if [[ "$AUTO_MODE" == "true" ]]; then
+        log_warn "AUTO mode enabled - no confirmation will be asked!"
+    else
+        log_info "MANUAL mode - confirmation will be asked for each disk"
+    fi
+    
+    # Final warning before proceeding
+    echo
+    log_warn "WARNING: This operation will destroy all data on the specified disks!"
+    log_warn "There is no undo for this operation!"
+    echo
+    
+    if [[ "$AUTO_MODE" == "false" ]]; then
+        read -p "Are you sure you want to continue? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Operation cancelled by user"
+            exit 0
         fi
-
-        for disk in "${disk_list[@]}"; do
-            # Skip sda unless --force is specified
-            if [[ "$disk" == "sda" && "$force_sda" == "false" ]]; then
-                log "WARN" "Skipping sda (use --force to wipe sda)."
-                continue
-            fi
-
-            # Check if disk exists
-            if [[ ! -e "/dev/$disk" ]]; then
-                log "ERROR" "Disk /dev/$disk does not exist."
-                continue
-            fi
-
-            # Confirm wipe in manual mode
-            if [[ "$mode" == "manual" ]]; then
-                read -p "Wipe /dev/$disk? (y/N): " confirm
-                [[ "$confirm" != "y" && "$confirm" != "Y" ]] && continue
-            fi
-
-            wipe_disk "$disk"
-        done
+    fi
+    
+    # Wipe each disk
+    for disk in "${TARGET_DISKS[@]}"; do
+        wipe_single_disk "$disk"
+        echo
     done
-
-    log "OK" "Disk wiping process completed. Check results with lsblk."
+    
+    log_ok "Disk wipe procedure completed successfully"
+    log_info "Use 'lsblk' to verify the results"
 }
 
-# Run main
+# Run main function with all arguments
 main "$@"
