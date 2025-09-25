@@ -1,158 +1,309 @@
-#!/usr/bin/env bash
-# disk-wipefs.sh v8.0
-# Author: ChatGPT & TrungLun0112
-# Purpose: Wipe a given disk clean (LVM, Ceph, ZFS, FS, partition table)
-
+#!/bin/bash
 set -euo pipefail
 
-#######################################
-# Logging
-#######################################
-log() { echo -e "$(date '+%F %T') [INFO] $*"; }
-warn() { echo -e "$(date '+%F %T') [WARN] $*"; }
-err() { echo -e "$(date '+%F %T') [ERROR] $*" >&2; exit 1; }
+# Colors for logging
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-#######################################
-# 1. Check OS + tools
-#######################################
-check_env() {
-    log "Checking OS and required tools..."
-    local tools=(lsblk blkid wipefs sgdisk dd dmsetup lvm ceph-volume zpool partprobe blockdev fuser realpath)
-    for t in "${tools[@]}"; do
-        command -v "$t" >/dev/null 2>&1 || err "Missing tool: $t"
+# Logging function
+log() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    case $level in
+        "INFO")  echo -e "${BLUE}[INFO] ${timestamp}: ${message}${NC}" ;;
+        "WARN")  echo -e "${YELLOW}[WARN] ${timestamp}: ${message}${NC}" ;;
+        "ERROR") echo -e "${RED}[ERROR] ${timestamp}: ${message}${NC}" ;;
+        "OK")    echo -e "${GREEN}[OK] ${timestamp}: ${message}${NC}" ;;
+    esac
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "This script must be run as root (use sudo)."
+        exit 1
+    fi
+}
+
+# Detect OS and package manager
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS=$ID
+        log "INFO" "Detected OS: $OS"
+    else
+        log "ERROR" "Cannot detect OS. /etc/os-release not found."
+        exit 1
+    fi
+}
+
+# Check and install required tools
+check_install_tools() {
+    local tools=("wipefs" "sgdisk" "mdadm" "pvremove" "vgremove" "lvremove" "partprobe" "blockdev" "udevadm")
+    local missing_tools=()
+    local pkg_manager=""
+    local install_cmd=""
+
+    # Determine package manager
+    case $OS in
+        ubuntu|debian)
+            pkg_manager="apt"
+            install_cmd="apt install -y"
+            ;;
+        centos|rhel|rocky|alma)
+            pkg_manager="yum"
+            install_cmd="yum install -y"
+            ;;
+        fedora)
+            pkg_manager="dnf"
+            install_cmd="dnf install -y"
+            ;;
+        suse|opensuse*)
+            pkg_manager="zypper"
+            install_cmd="zypper install -y"
+            ;;
+        arch)
+            pkg_manager="pacman"
+            install_cmd="pacman -S --noconfirm"
+            ;;
+        *)
+            log "ERROR" "Unsupported OS: $OS"
+            exit 1
+            ;;
+    esac
+
+    # Check for missing tools
+    for tool in "${tools[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            missing_tools+=("$tool")
+        fi
     done
-    log "All essential tools present"
+
+    # Check for ceph-volume and zfsutils
+    if ! command -v ceph-volume &>/dev/null; then
+        missing_tools+=("ceph-volume")
+    fi
+    if ! command -v zpool &>/dev/null; then
+        missing_tools+=("zfsutils")
+    fi
+
+    # Install missing tools
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log "INFO" "Missing tools: ${missing_tools[*]}. Installing..."
+
+        # Fix CDROM issue for apt-based systems
+        if [[ $pkg_manager == "apt" ]]; then
+            log "INFO" "Checking and fixing CDROM in /etc/apt/sources.list..."
+            sed -i '/cdrom/s/^/#/' /etc/apt/sources.list || log "WARN" "Failed to fix CDROM sources."
+            apt update || { log "ERROR" "Failed to run apt update."; exit 1; }
+        fi
+
+        # Install packages
+        case $OS in
+            ubuntu|debian)
+                $install_cmd util-linux parted mdadm lvm2 ceph zfsutils-linux
+                ;;
+            centos|rhel|rocky|alma)
+                $install_cmd util-linux parted mdadm lvm2 cephadm zfsutils
+                ;;
+            fedora)
+                $install_cmd util-linux parted mdadm lvm2 ceph zfs
+                ;;
+            suse|opensuse*)
+                $install_cmd util-linux parted mdadm lvm2 ceph zfsutils
+                ;;
+            arch)
+                $install_cmd util-linux parted mdadm lvm2 ceph zfsutils
+                ;;
+        esac
+        log "OK" "Required tools installed."
+    else
+        log "INFO" "All required tools are already installed."
+    fi
 }
 
-#######################################
-# 2. Validate input
-#######################################
-validate_target() {
-    [[ $# -eq 1 ]] || err "Usage: $0 <disk>"
-    local disk="/dev/$1"
+# Wipe disk function
+wipe_disk() {
+    local disk=$1
+    log "INFO" "Processing disk: /dev/$disk"
 
-    [[ -b "$disk" ]] || err "$disk is not a block device"
-    [[ "$disk" == /dev/sda ]] && err "Refusing to wipe system disk: $disk"
-
-    TARGET=$(realpath "$disk")
-    log "Target disk resolved: $TARGET"
-
-    log "Partitions on $TARGET:"
-    lsblk "$TARGET" || true
-}
-
-#######################################
-# 3. Pre-clean
-#######################################
-preclean() {
-    log "[preclean] Unmount partitions of $TARGET"
-    umount -f "${TARGET}"* 2>/dev/null || true
-
-    log "[preclean] swapoff for $TARGET"
-    swapoff "${TARGET}"* 2>/dev/null || warn "No active swap found"
-
-    log "[preclean] Kill processes using $TARGET"
-    fuser -km "${TARGET}"* 2>/dev/null || true
-}
-
-#######################################
-# 4. LVM cleanup
-#######################################
-lvm_cleanup() {
-    log "[lvm] Cleaning LVM metadata on $TARGET"
-    pvs --noheadings -o pv_name,vg_name 2>/dev/null | grep -q "$TARGET" || { log "No LVM PVs on $TARGET"; return; }
-
-    local vgs
-    vgs=$(pvs --noheadings -o vg_name "$TARGET" 2>/dev/null | awk '{print $1}' | sort -u)
-    for vg in $vgs; do
-        log "Deactivating VG: $vg"
-        vgchange -an "$vg" || true
+    # Unmount any partitions
+    for part in /dev/"$disk"[0-9]*; do
+        if [[ -e "$part" ]]; then
+            if mountpoint -q "$part"; then
+                log "INFO" "Unmounting $part"
+                umount "$part" || log "WARN" "Failed to unmount $part"
+            fi
+        done
     done
 
-    log "Removing PVs on $TARGET"
-    pvremove -ff -y "${TARGET}"* || true
+    # Wipe filesystem signatures
+    log "INFO" "Wiping filesystem signatures on /dev/$disk"
+    wipefs -a "/dev/$disk" || log "WARN" "Failed to wipe filesystem signatures on /dev/$disk"
+
+    # Wipe partition table
+    log "INFO" "Wiping partition table on /dev/$disk"
+    sgdisk --zap-all "/dev/$disk" || log "WARN" "Failed to wipe partition table on /dev/$disk"
+
+    # Wipe RAID superblock
+    if mdadm --examine "/dev/$disk" &>/dev/null; then
+        log "INFO" "Wiping RAID superblock on /dev/$disk"
+        mdadm --zero-superblock "/dev/$disk" || log "WARN" "Failed to wipe RAID superblock on /dev/$disk"
+    fi
+
+    # Wipe LVM metadata
+    if pvdisplay "/dev/$disk" &>/dev/null; then
+        log "INFO" "Wiping LVM metadata on /dev/$disk"
+        lvremove -f /dev/*/* || true
+        vgremove -f /dev/* || true
+        pvremove -f "/dev/$disk" || log "WARN" "Failed to wipe LVM metadata on /dev/$disk"
+    fi
+
+    # Wipe Ceph OSD
+    if ceph-volume lvm list "/dev/$disk" &>/dev/null; then
+        log "INFO" "Wiping Ceph OSD on /dev/$disk"
+        ceph-volume lvm zap --destroy "/dev/$disk" || log "WARN" "Failed to wipe Ceph OSD on /dev/$disk"
+    fi
+
+    # Wipe ZFS labels
+    if zpool import -d "/dev/$disk" &>/dev/null; then
+        log "INFO" "Wiping ZFS labels on /dev/$disk"
+        zpool labelclear -f "/dev/$disk" || log "WARN" "Failed to wipe ZFS labels on /dev/$disk"
+    fi
+
+    # Wipe residual data (10MB at start and end)
+    log "INFO" "Wiping 10MB at start and end of /dev/$disk"
+    dd if=/dev/zero of="/dev/$disk" bs=1M count=10 status=none || log "WARN" "Failed to wipe start of /dev/$disk"
+    dd if=/dev/zero of="/dev/$disk" bs=1M count=10 seek=$(( $(blockdev --getsize64 "/dev/$disk") / 1048576 - 10 )) status=none || log "WARN" "Failed to wipe end of /dev/$disk"
+
+    # Reload disk table
+    log "INFO" "Reloading disk table for /dev/$disk"
+    partprobe "/dev/$disk" || log "WARN" "Failed to run partprobe on /dev/$disk"
+    blockdev --rereadpt "/dev/$disk" || log "WARN" "Failed to run blockdev --rereadpt on /dev/$disk"
+    udevadm trigger || log "WARN" "Failed to run udevadm trigger"
+    log "OK" "Disk /dev/$disk wiped successfully."
 }
 
-#######################################
-# 5. Device Mapper cleanup
-#######################################
-dm_cleanup() {
-    log "[dm] Removing device-mapper maps for $TARGET"
-    local maps
-    maps=$(dmsetup ls --tree 2>/dev/null | grep "$TARGET" | awk '{print $1}')
-    for m in $maps; do
-        log "Removing dm map: $m"
-        dmsetup remove -f "$m" || true
-    done
+# Get list of disks to process
+get_disks() {
+    local pattern=$1
+    local exclude_list=$2
+    local disks=()
+
+    # Get all disks matching pattern
+    if [[ "$pattern" == "all" ]]; then
+        mapfile -t disks < <(ls /dev/{sd*,nvme*,vd*,mmcblk*} 2>/dev/null | grep -vE 'sda|sr|dm|loop|mapper' | sed 's|/dev/||')
+    else
+        mapfile -t disks < <(ls /dev/$pattern 2>/dev/null | grep -vE 'sda|sr|dm|loop|mapper' | sed 's|/dev/||')
+    fi
+
+    # Apply exclude list
+    if [[ -n "$exclude_list" ]]; then
+        local filtered_disks=()
+        IFS=',' read -ra exclude_arr <<< "$exclude_list"
+        for disk in "${disks[@]}"; do
+            local skip=false
+            for exclude in "${exclude_arr[@]}"; do
+                if [[ "$disk" == "$exclude" ]]; then
+                    skip=true
+                    break
+                fi
+            done
+            [[ "$skip" == false ]] && filtered_disks+=("$disk")
+        done
+        disks=("${filtered_disks[@]}")
+    fi
+
+    echo "${disks[@]}"
 }
 
-#######################################
-# 6. Ceph cleanup
-#######################################
-ceph_cleanup() {
-    log "[ceph] Zapping Ceph OSD metadata on $TARGET"
-    ceph-volume lvm zap "$TARGET" --destroy || log "No Ceph OSDs on $TARGET"
+# Display help
+show_help() {
+    cat << EOF
+Usage: $0 [options] [disk1 disk2 ... | pattern | all]
+
+Options:
+  --auto           Run automatically without confirmation for each disk.
+  --manual         Prompt for confirmation for each disk (default).
+  --all            Wipe all disks (excludes sda unless --force specified).
+  --force          Allow wiping sda (dangerous).
+  --exclude <list> Comma-separated list of disks to exclude (e.g., sda,nvme0n1).
+  --help           Show this help message.
+
+Examples:
+  Wipe specific disks: sudo $0 sdb nvme0n1
+  Wipe all disks (except sda): sudo $0 all --auto
+  Wipe disks matching pattern: sudo $0 sd*
+  Wipe all disks including sda: sudo $0 all --force --auto
+EOF
+    exit 0
 }
 
-#######################################
-# 7. ZFS cleanup
-#######################################
-zfs_cleanup() {
-    log "[zfs] Clearing ZFS labels on $TARGET"
-    zpool labelclear -f "$TARGET" || log "No ZFS labels on $TARGET"
-}
-
-#######################################
-# 8. Metadata wipe
-#######################################
-metadata_wipe() {
-    log "[wipefs] Wiping FS signatures"
-    wipefs -a -f "$TARGET" || true
-
-    log "[sgdisk] Zapping GPT/MBR"
-    sgdisk --zap-all --clear "$TARGET" || true
-
-    log "[dd] Zeroing first 10MB"
-    dd if=/dev/zero of="$TARGET" bs=1M count=10 conv=fsync status=none
-
-    log "[dd] Zeroing last 10MB"
-    local size
-    size=$(blockdev --getsz "$TARGET")
-    dd if=/dev/zero of="$TARGET" bs=512 seek=$((size-20480)) count=20480 conv=fsync status=none || true
-}
-
-#######################################
-# 9. Reload kernel
-#######################################
-reload_kernel() {
-    log "[kernel] Reloading partition table"
-    partprobe "$TARGET" || blockdev --rereadpt "$TARGET" || true
-}
-
-#######################################
-# 10. Verify
-#######################################
-verify_clean() {
-    log "[verify] Checking $TARGET"
-    lsblk -f "$TARGET"
-    blkid "$TARGET" || log "No signatures detected (expected clean disk)"
-}
-
-#######################################
-# Main
-#######################################
+# Main function
 main() {
-    check_env
-    validate_target "$@"
-    preclean
-    lvm_cleanup
-    dm_cleanup
-    ceph_cleanup
-    zfs_cleanup
-    metadata_wipe
-    reload_kernel
-    verify_clean
-    log "Disk wipe completed for $TARGET"
+    check_root
+    detect_os
+    check_install_tools
+
+    local mode="manual"
+    local force_sda=false
+    local exclude_list=""
+    local disks=()
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --auto) mode="auto"; shift ;;
+            --manual) mode="manual"; shift ;;
+            --force) force_sda=true; shift ;;
+            --exclude) exclude_list="$2"; shift 2 ;;
+            --help) show_help ;;
+            *) disks+=("$1"); shift ;;
+        esac
+    done
+
+    # Default to all disks if no disks or pattern specified
+    if [[ ${#disks[@]} -eq 0 ]]; then
+        disks=("all")
+    fi
+
+    # Process each disk or pattern
+    for pattern in "${disks[@]}"; do
+        local disk_list=($(get_disks "$pattern" "$exclude_list"))
+        if [[ ${#disk_list[@]} -eq 0 ]]; then
+            log "WARN" "No disks found matching pattern: $pattern"
+            continue
+        fi
+
+        for disk in "${disk_list[@]}"; do
+            # Skip sda unless --force is specified
+            if [[ "$disk" == "sda" && "$force_sda" == "false" ]]; then
+                log "WARN" "Skipping sda (use --force to wipe sda)."
+                continue
+            fi
+
+            # Check if disk exists
+            if [[ ! -e "/dev/$disk" ]]; then
+                log "ERROR" "Disk /dev/$disk does not exist."
+                continue
+            fi
+
+            # Confirm wipe in manual mode
+            if [[ "$mode" == "manual" ]]; then
+                read -p "Wipe /dev/$disk? (y/N): " confirm
+                [[ "$confirm" != "y" && "$confirm" != "Y" ]] && continue
+            fi
+
+            wipe_disk "$disk"
+        done
+    done
+
+    log "OK" "Disk wiping process completed. Check results with lsblk."
 }
 
+# Run main
 main "$@"
