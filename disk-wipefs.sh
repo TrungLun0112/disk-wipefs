@@ -168,29 +168,90 @@ expand_disk_patterns() {
     printf '%s\n' "${expanded[@]}" | sort -u
 }
 
+# Stop any processes using the disk
+stop_disk_processes() {
+    local disk=$1
+    log_info "Stopping processes using /dev/$disk"
+    
+    # Kill processes using the disk or its partitions
+    for partition in "/dev/$disk" "/dev/${disk}[0-9]*" "/dev/${disk}p[0-9]*"; do
+        if ls $partition >/dev/null 2>&1; then
+            for dev in $partition; do
+                if [[ -b "$dev" ]]; then
+                    # Find and kill processes
+                    local pids=$(lsof +f -- "$dev" 2>/dev/null | awk 'NR>1 {print $2}' | sort -u)
+                    if [[ -n "$pids" ]]; then
+                        log_warn "Killing processes using $dev: $pids"
+                        kill -9 $pids 2>/dev/null || true
+                    fi
+                    
+                    # Use fuser if available
+                    if command -v fuser >/dev/null; then
+                        fuser -k -s "$dev" 2>/dev/null || true
+                    fi
+                fi
+            done
+        fi
+    done
+    
+    sleep 2
+}
+
 # Unmount any filesystems on disk
 unmount_disk() {
     local disk=$1
-    local mounted_paths=$(lsblk -nlo MOUNTPOINT "/dev/$disk" 2>/dev/null | grep -v '^$' || true)
+    log_info "Unmounting filesystems on /dev/$disk"
     
-    if [[ -n "$mounted_paths" ]]; then
-        log_warn "Unmounting filesystems on /dev/$disk"
-        for mountpoint in $mounted_paths; do
-            umount -l "$mountpoint" 2>/dev/null || true
-        done
+    # Unmount all partitions
+    for partition in "/dev/${disk}[0-9]*" "/dev/${disk}p[0-9]*"; do
+        if ls $partition >/dev/null 2>&1; then
+            for part in $partition; do
+                if [[ -b "$part" ]]; then
+                    local mountpoint=$(findmnt -n -o TARGET "$part" 2>/dev/null || true)
+                    if [[ -n "$mountpoint" ]]; then
+                        log_warn "Unmounting $part from $mountpoint"
+                        umount -lf "$part" 2>/dev/null || true
+                    fi
+                fi
+            done
+        fi
+    done
+    
+    # Also try to unmount the disk itself
+    local mountpoint=$(findmnt -n -o TARGET "/dev/$disk" 2>/dev/null || true)
+    if [[ -n "$mountpoint" ]]; then
+        log_warn "Unmounting /dev/$disk from $mountpoint"
+        umount -lf "/dev/$disk" 2>/dev/null || true
     fi
+    
+    sleep 2
 }
 
-# Remove LVM signatures
+# Remove LVM signatures - ENHANCED VERSION
 remove_lvm() {
     local disk=$1
-    local lvm_devices=$(pvs --noheadings -o pv_name 2>/dev/null | grep "$disk" || true)
+    log_info "Removing LVM signatures from /dev/$disk"
     
-    if [[ -n "$lvm_devices" ]]; then
-        log_warn "Removing LVM signatures from /dev/$disk"
-        pvremove -ff "/dev/$disk" 2>/dev/null || true
-        wipefs -a "/dev/$disk" 2>/dev/null || true
+    # Deactivate any volume groups on this disk
+    for vg in $(pvs --noheadings -o vg_name "/dev/$disk" 2>/dev/null | sed 's/^[[:space:]]*//'); do
+        if [[ -n "$vg" ]]; then
+            log_warn "Deactivating volume group: $vg"
+            vgchange -an "$vg" 2>/dev/null || true
+            sleep 1
+        fi
+    done
+    
+    # Remove physical volumes
+    if pvs "/dev/$disk" >/dev/null 2>&1; then
+        log_warn "Removing physical volume: /dev/$disk"
+        pvremove -ff -y "/dev/$disk" 2>/dev/null || true
     fi
+    
+    # Wipe LVM signatures
+    wipefs -a "/dev/$disk" 2>/dev/null || true
+    
+    # Additional LVM signature removal
+    dd if=/dev/zero of="/dev/$disk" bs=512 count=8 seek=1 conv=notrunc 2>/dev/null || true
 }
 
 # Remove MD RAID signatures
@@ -199,6 +260,11 @@ remove_mdraid() {
     if mdadm --examine "/dev/$disk" 2>/dev/null; then
         log_warn "Removing MD RAID signatures from /dev/$disk"
         mdadm --zero-superblock "/dev/$disk" 2>/dev/null || true
+        for md in /dev/md[0-9]*; do
+            if [[ -b "$md" ]]; then
+                mdadm --stop "$md" 2>/dev/null || true
+            fi
+        done
     fi
 }
 
@@ -224,43 +290,86 @@ remove_zfs() {
     fi
 }
 
-# Wipe partition tables and signatures
+# Wipe partition tables and signatures - ENHANCED VERSION
 wipe_signatures() {
     local disk=$1
     log_info "Wiping all signatures from /dev/$disk"
     
-    # First pass: wipefs
+    # Multiple passes to ensure complete wipe
+    
+    # Pass 1: wipefs for all signatures
     wipefs -a "/dev/$disk" 2>/dev/null || true
+    sleep 1
     
-    # Second pass: sgdisk for GPT
+    # Pass 2: sgdisk for GPT
     sgdisk --zap-all "/dev/$disk" 2>/dev/null || true
+    sleep 1
     
-    # Third pass: dd first 10MB
-    dd if=/dev/zero of="/dev/$disk" bs=1M count=10 status=none 2>/dev/null || true
+    # Pass 3: dd first 1MB (covers MBR and GPT header)
+    dd if=/dev/zero of="/dev/$disk" bs=1M count=1 status=none 2>/dev/null || true
+    sleep 1
     
-    # Fourth pass: dd last 10MB (if disk size > 20MB)
+    # Pass 4: dd last 1MB (covers GPT backup)
     local size=$(blockdev --getsize64 "/dev/$disk" 2>/dev/null || echo 0)
-    if [[ $size -gt 20971520 ]]; then
-        local seek_position=$(( (size - 10485760) / 1048576 ))
+    if [[ $size -gt 2097152 ]]; then
+        local seek_position=$(( (size - 1048576) / 1048576 ))
         dd if=/dev/zero of="/dev/$disk" bs=1M seek=$seek_position status=none 2>/dev/null || true
     fi
+    sleep 1
+    
+    # Pass 5: Additional wipe for stubborn signatures
+    dd if=/dev/zero of="/dev/$disk" bs=512 count=1000 status=none 2>/dev/null || true
 }
 
-# Reload disk information
-reload_disk() {
+# Remove partition mappings from kernel
+remove_partition_mappings() {
     local disk=$1
-    log_info "Reloading disk information for /dev/$disk"
+    log_info "Removing partition mappings for /dev/$disk"
     
-    # Try multiple methods to reload disk
-    partprobe "/dev/$disk" 2>/dev/null || true
-    blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
-    udevadm settle --timeout=10 2>/dev/null || true
-    udevadm trigger --name-match="/dev/$disk" 2>/dev/null || true
+    # Remove device mapper entries
+    for dm in $(dmsetup ls | grep "$disk" | cut -f1); do
+        log_warn "Removing device mapper: $dm"
+        dmsetup remove "$dm" 2>/dev/null || true
+    done
+    
+    # Remove any remaining partition mappings
+    for part in "/dev/${disk}[0-9]*" "/dev/${disk}p[0-9]*"; do
+        if ls $part >/dev/null 2>&1; then
+            for partition in $part; do
+                if [[ -b "$partition" ]]; then
+                    log_warn "Removing partition mapping: $partition"
+                    echo 1 > "/sys/block/$disk/device/delete" 2>/dev/null || true
+                fi
+            done
+        fi
+    done
     
     sleep 2
 }
 
-# Wipe a single disk
+# Reload disk information - ENHANCED VERSION
+reload_disk() {
+    local disk=$1
+    log_info "Reloading disk information for /dev/$disk"
+    
+    # Multiple methods to ensure disk is reloaded
+    partprobe "/dev/$disk" 2>/dev/null || true
+    blockdev --rereadpt "/dev/$disk" 2>/dev/null || true
+    udevadm settle --timeout=30 2>/dev/null || true
+    udevadm trigger --name-match="/dev/$disk" 2>/dev/null || true
+    echo 1 > "/sys/block/$disk/device/rescan" 2>/dev/null || true
+    
+    sleep 3
+    
+    # Final verification
+    if [[ -b "/dev/$disk" ]]; then
+        log_ok "Disk /dev/$disk successfully reloaded"
+    else
+        log_warn "Disk /dev/$disk may need manual rescan"
+    fi
+}
+
+# Wipe a single disk - COMPLETELY REVISED VERSION
 wipe_single_disk() {
     local disk=$1
     
@@ -284,24 +393,41 @@ wipe_single_disk() {
         fi
     fi
     
-    log_info "Starting wipe process for /dev/$disk"
+    log_info "Starting COMPLETE wipe process for /dev/$disk"
+    
+    # Step 0: Stop processes using the disk
+    stop_disk_processes "$disk"
     
     # Step 1: Unmount any filesystems
     unmount_disk "$disk"
     
-    # Step 2: Remove various signatures
+    # Step 2: Remove partition mappings
+    remove_partition_mappings "$disk"
+    
+    # Step 3: Remove various signatures (LVM first as it's often the issue)
     remove_lvm "$disk"
     remove_mdraid "$disk"
     remove_ceph "$disk"
     remove_zfs "$disk"
     
-    # Step 3: Wipe all signatures and data
+    # Step 4: Wipe all signatures and data (multiple passes)
     wipe_signatures "$disk"
     
-    # Step 4: Reload disk information
+    # Step 5: Final LVM cleanup (in case anything was missed)
+    remove_lvm "$disk"
+    
+    # Step 6: Reload disk information
     reload_disk "$disk"
     
-    log_ok "Successfully wiped /dev/$disk"
+    # Step 7: Final verification
+    local remaining_partitions=$(lsblk -nlo NAME "/dev/$disk" 2>/dev/null | grep -v "^${disk}$" | wc -l)
+    if [[ $remaining_partitions -gt 0 ]]; then
+        log_warn "Partitions still detected on /dev/$disk - performing final cleanup"
+        wipe_signatures "$disk"
+        reload_disk "$disk"
+    fi
+    
+    log_ok "Successfully COMPLETELY wiped /dev/$disk"
 }
 
 # Display usage information
@@ -309,7 +435,7 @@ show_help() {
     cat << EOF
 Usage: $0 [OPTIONS] [DISK_PATTERNS...]
 
-Wipe disk signatures and data using multiple methods.
+COMPLETELY wipe disk signatures and data using multiple aggressive methods.
 
 DISK_PATTERNS:
   all                    Wipe all disks (excluding sda by default)
@@ -339,7 +465,7 @@ Examples:
   # Wipe all disks except sda and nvme0n1
   $0 all --auto --exclude sda,nvme0n1
 
-WARNING: This will destroy all data on the specified disks!
+WARNING: This will DESTROY ALL DATA on the specified disks!
 EOF
 }
 
@@ -406,7 +532,7 @@ parse_arguments() {
 
 # Main function
 main() {
-    log_info "Starting disk wipe procedure"
+    log_info "Starting COMPLETE disk wipe procedure"
     
     # Check root privileges
     if [[ $EUID -ne 0 ]]; then
@@ -436,8 +562,9 @@ main() {
     
     # Final warning before proceeding
     echo
-    log_warn "WARNING: This operation will destroy all data on the specified disks!"
-    log_warn "There is no undo for this operation!"
+    log_warn "WARNING: This operation will DESTROY ALL DATA on the specified disks!"
+    log_warn "There is NO UNDO for this operation!"
+    log_warn "This is an AGGRESSIVE wipe that will remove LVM, partitions, and all signatures!"
     echo
     
     if [[ "$AUTO_MODE" == "false" ]]; then
@@ -455,8 +582,11 @@ main() {
         echo
     done
     
-    log_ok "Disk wipe procedure completed successfully"
+    log_ok "COMPLETE disk wipe procedure finished"
     log_info "Use 'lsblk' to verify the results"
+    echo
+    log_info "Current disk status:"
+    lsblk
 }
 
 # Run main function with all arguments
