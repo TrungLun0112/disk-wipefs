@@ -14,8 +14,9 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_ok() { echo -e "${GREEN}[OK]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
-# Default excluded disks (always excluded unless --force is used)
-DEFAULT_EXCLUDED=("sda" "sr*" "dm*" "loop*" "mapper*")
+# Default excluded disks (always excluded unless --force is used for sda)
+# sr*: CD/DVD drives, dm*: device mapper, loop*: loop devices, mapper*: LVM mappings
+DEFAULT_EXCLUDED=("sr*" "dm*" "loop*" "mapper*")
 USER_EXCLUDED=()
 TARGET_DISKS=()
 AUTO_MODE=false
@@ -110,14 +111,14 @@ install_dependencies() {
     log_ok "Dependencies installed successfully"
 }
 
-# Get all available disks
+# Get all available disks (including sda, but it will be filtered later)
 get_all_disks() {
     local disks=()
     local patterns=("sd*" "nvme*" "vd*" "mmcblk*")
     
     for pattern in "${patterns[@]}"; do
         for disk in /dev/$pattern; do
-            if [[ -b "$disk" && ! "$disk" =~ /dev/sda$ ]]; then
+            if [[ -b "$disk" ]]; then
                 disks+=("$(basename "$disk")")
             fi
         done
@@ -126,45 +127,75 @@ get_all_disks() {
     printf '%s\n' "${disks[@]}"
 }
 
-# Check if disk should be excluded
+# Enhanced disk exclusion check
 is_disk_excluded() {
     local disk=$1
-    local exclude_list=("${DEFAULT_EXCLUDED[@]}" "${USER_EXCLUDED[@]}")
     
-    for pattern in "${exclude_list[@]}"; do
+    # Always exclude special devices regardless of force mode
+    for pattern in "${DEFAULT_EXCLUDED[@]}"; do
         if [[ "$disk" == $pattern ]]; then
+            log_info "Excluding special device: /dev/$disk"
             return 0
         fi
     done
     
+    # Check user excluded patterns
+    for pattern in "${USER_EXCLUDED[@]}"; do
+        if [[ "$disk" == $pattern ]]; then
+            log_info "Excluding user-specified device: /dev/$disk"
+            return 0
+        fi
+    done
+    
+    # Special handling for sda - only allow with --force
+    if [[ "$disk" == "sda" && "$FORCE_MODE" != "true" ]]; then
+        log_warn "Excluding /dev/sda (use --force to override)"
+        return 0
+    fi
+    
     return 1
 }
 
-# Expand disk patterns (sd*, nvme*, etc.)
+# Safe disk pattern expansion with exclusion checking
 expand_disk_patterns() {
     local patterns=("$@")
     local expanded=()
+    local final_disks=()
     
     for pattern in "${patterns[@]}"; do
         if [[ "$pattern" == "all" ]]; then
+            # Get all disks and filter exclusions
             mapfile -t all_disks < <(get_all_disks)
-            expanded+=("${all_disks[@]}")
+            for disk in "${all_disks[@]}"; do
+                if ! is_disk_excluded "$disk"; then
+                    expanded+=("$disk")
+                fi
+            done
         elif [[ $pattern == *"*"* ]]; then
+            # Expand wildcard patterns
             for disk in /dev/$pattern; do
                 if [[ -b "$disk" ]]; then
-                    expanded+=("$(basename "$disk")")
+                    disk_name=$(basename "$disk")
+                    if ! is_disk_excluded "$disk_name"; then
+                        expanded+=("$disk_name")
+                    fi
                 fi
             done
         else
+            # Specific disk name
             if [[ -b "/dev/$pattern" ]]; then
-                expanded+=("$pattern")
+                if ! is_disk_excluded "$pattern"; then
+                    expanded+=("$pattern")
+                else
+                    log_warn "Disk /dev/$pattern is excluded, skipping"
+                fi
             else
                 log_warn "Disk /dev/$pattern not found, skipping"
             fi
         fi
     done
     
-    # Remove duplicates
+    # Remove duplicates and return
     printf '%s\n' "${expanded[@]}" | sort -u
 }
 
@@ -227,7 +258,7 @@ unmount_disk() {
     sleep 2
 }
 
-# Remove LVM signatures - ENHANCED VERSION
+# Remove LVM signatures
 remove_lvm() {
     local disk=$1
     log_info "Removing LVM signatures from /dev/$disk"
@@ -290,7 +321,7 @@ remove_zfs() {
     fi
 }
 
-# Wipe partition tables and signatures - ENHANCED VERSION
+# Wipe partition tables and signatures
 wipe_signatures() {
     local disk=$1
     log_info "Wiping all signatures from /dev/$disk"
@@ -321,7 +352,7 @@ wipe_signatures() {
     dd if=/dev/zero of="/dev/$disk" bs=512 count=1000 status=none 2>/dev/null || true
 }
 
-# Remove partition mappings from kernel - FIXED VERSION
+# Remove partition mappings from kernel (without removing disk itself)
 remove_partition_mappings() {
     local disk=$1
     log_info "Removing partition mappings for /dev/$disk"
@@ -332,8 +363,6 @@ remove_partition_mappings() {
         dmsetup remove "$dm" 2>/dev/null || true
     done
     
-    # Don't remove the disk itself from system, only partitions
-    # This is what was causing the disk to disappear
     sleep 2
 }
 
@@ -357,12 +386,12 @@ rescan_scsi_bus() {
     fi
     
     # Also try generic rescan
-    if [[ -d "/sys/block/$disk" ]]; then
+    if [[ -d "/sys/block/$disk/device" ]]; then
         echo 1 > "/sys/block/$disk/device/rescan" 2>/dev/null || true
     fi
 }
 
-# Reload disk information - FIXED VERSION
+# Reload disk information
 reload_disk() {
     local disk=$1
     log_info "Reloading disk information for /dev/$disk"
@@ -405,15 +434,11 @@ reload_disk() {
     fi
 }
 
-# Wipe a single disk - FIXED VERSION
+# Wipe a single disk
 wipe_single_disk() {
     local disk=$1
     
-    if [[ "$disk" == "sda" && "$FORCE_MODE" != "true" ]]; then
-        log_warn "Skipping /dev/sda (use --force to override)"
-        return 0
-    fi
-    
+    # Final safety check (should have been handled in expand_disk_patterns, but double-check)
     if is_disk_excluded "$disk"; then
         log_warn "Skipping excluded disk: /dev/$disk"
         return 0
@@ -497,18 +522,24 @@ DISK_PATTERNS:
 OPTIONS:
   --auto                 Run automatically without confirmation
   --manual               Ask for confirmation for each disk (default)
-  --force                Allow wiping /dev/sda and other excluded disks
+  --force                Allow wiping /dev/sda (DANGEROUS)
   --exclude sda,nvme0n1  Exclude specific disks from wiping
   --help                 Show this help message
+
+DEFAULT EXCLUSIONS (always excluded):
+  sr*    (CD/DVD drives)
+  dm*    (device mapper devices)
+  loop*  (loop devices)
+  mapper* (LVM mappings)
 
 Examples:
   # Wipe specific disks
   $0 sdb nvme0n1
 
-  # Wipe all disks automatically (excluding sda)
+  # Wipe all disks automatically (excluding sda and special devices)
   $0 all --auto
 
-  # Wipe all sd* disks with force
+  # Wipe all sd* disks with force (including sda)
   $0 sd* --auto --force
 
   # Wipe all disks except sda and nvme0n1
@@ -536,11 +567,13 @@ parse_arguments() {
                 ;;
             --force)
                 FORCE_MODE=true
+                log_warn "FORCE mode enabled - /dev/sda may be wiped!"
                 shift
                 ;;
             --exclude)
                 if [[ -n "${2:-}" ]]; then
                     IFS=',' read -ra USER_EXCLUDED <<< "$2"
+                    log_info "User excluded disks: ${USER_EXCLUDED[*]}"
                     shift 2
                 else
                     log_error "--exclude requires a comma-separated list"
@@ -570,11 +603,11 @@ parse_arguments() {
         exit 1
     fi
     
-    # Expand disk patterns
+    # Expand disk patterns with exclusion checking
     mapfile -t TARGET_DISKS < <(expand_disk_patterns "${patterns[@]}")
     
     if [[ ${#TARGET_DISKS[@]} -eq 0 ]]; then
-        log_error "No valid disks found matching the patterns"
+        log_error "No valid disks found matching the patterns (after exclusions)"
         exit 1
     fi
 }
@@ -597,10 +630,9 @@ main() {
     parse_arguments "$@"
     
     log_info "Target disks: ${TARGET_DISKS[*]}"
-    log_info "Excluded disks: ${DEFAULT_EXCLUDED[*]} ${USER_EXCLUDED[*]}"
-    
-    if [[ "$FORCE_MODE" == "true" ]]; then
-        log_warn "FORCE mode enabled - /dev/sda and other excluded disks may be wiped!"
+    log_info "Default exclusions: ${DEFAULT_EXCLUDED[*]}"
+    if [[ ${#USER_EXCLUDED[@]} -gt 0 ]]; then
+        log_info "User exclusions: ${USER_EXCLUDED[*]}"
     fi
     
     if [[ "$AUTO_MODE" == "true" ]]; then
