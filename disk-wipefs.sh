@@ -1,134 +1,125 @@
 #!/usr/bin/env bash
-# disk-wipefs.sh v7.5
-# Safely wipe a disk clean (LVM, Ceph, ZFS, signatures...)
+# disk-wipefs.sh v7.6
+# Purpose: Clean target disk safely & completely
+# Author: bạn & ChatGPT (let go tới v100 :D)
 
 set -euo pipefail
 
-DISK=""
-WIPE_ALL=false
+### GLOBAL
+TARGET=""
+SCRIPT_NAME=$(basename "$0")
 
-log() { echo -e "[*] $1"; }
-err() { echo -e "[!] $1" >&2; }
-
+### HELP
 usage() {
-    echo "Usage: $0 <disk> | --all"
-    echo "Example: $0 sdb"
-    echo "         $0 --all   # wipe all except system disk (sda)"
+    echo "Usage: $SCRIPT_NAME <disk>"
+    echo "Example: $SCRIPT_NAME /dev/sdb"
     exit 1
 }
 
-# === CHECK FUNCTIONS ===
-check_root() { [[ $EUID -ne 0 ]] && { err "Run as root!"; exit 1; }; }
-check_tools() {
-    for t in lsblk umount swapoff vgchange lvremove dmsetup wipefs sgdisk dd partprobe; do
-        command -v $t &>/dev/null || { err "Missing tool: $t"; exit 1; }
+### STEP 0 - Check OS & Tools
+check_prereq() {
+    echo "[*] Checking OS & required tools..."
+    command -v wipefs >/dev/null || { echo "[!] wipefs not found"; exit 1; }
+    command -v sgdisk >/dev/null || echo "[!] sgdisk not installed, skip GPT zap"
+    command -v dd >/dev/null || echo "[!] dd not installed, skip MBR wipe"
+    command -v dmsetup >/dev/null || echo "[!] dmsetup not installed, skip dm removal"
+    command -v pvscan >/dev/null || echo "[!] lvm2 not installed, skip LVM deactivate"
+    command -v ceph-volume >/dev/null || echo "[!] ceph-volume not installed, skip Ceph zap"
+    command -v zpool >/dev/null || echo "[!] zpool not installed, skip ZFS cleanup"
+}
+
+### STEP 1 - Validate input
+validate_target() {
+    [[ $# -lt 1 ]] && usage
+    TARGET=$1
+    if [[ ! -b $TARGET ]]; then
+        echo "[!] $TARGET is not a block device"
+        exit 1
+    fi
+    echo "[*] Target disk: $TARGET"
+}
+
+### STEP 2 - Unmount
+do_unmount() {
+    echo "[*] Unmounting partitions on $TARGET..."
+    for p in $(lsblk -ln -o NAME "$TARGET" | tail -n +2); do
+        umount -f "/dev/$p" 2>/dev/null || true
     done
 }
 
-# === CORE ACTIONS ===
-unmount_partitions() {
-    local d=$1
-    log "Unmounting partitions on /dev/$d..."
-    lsblk -ln "/dev/$d" | awk '$6=="part"{print $1}' | while read -r part; do
-        mountpoint=$(lsblk -no MOUNTPOINT "/dev/$part" || true)
-        [[ -n "$mountpoint" ]] && umount -f "/dev/$part" || true
-    done
+### STEP 3 - swapoff
+do_swapoff() {
+    echo "[*] Disabling swap on $TARGET..."
+    swapoff "$TARGET"* 2>/dev/null || true
 }
 
-disable_swap() {
-    local d=$1
-    log "Disabling swap on /dev/$d..."
-    swapoff -a || true
-    sed -i.bak "/$d/d" /etc/fstab
+### STEP 4 - LVM deactivate
+do_lvm() {
+    echo "[*] Deactivating LVM on $TARGET..."
+    vgchange -an 2>/dev/null || true
+    pvremove -ff -y "$TARGET" 2>/dev/null || true
 }
 
-deactivate_lvm() {
-    local d=$1
-    log "Deactivating LVM on /dev/$d..."
-    pvs --noheadings -o vg_name "/dev/$d" 2>/dev/null | sort -u | while read -r vg; do
-        [[ -n "$vg" ]] || continue
-        lvchange -an "$vg" || true
-        vgremove -ff "$vg" || true
-    done
+### STEP 5 - dmsetup remove
+do_dmsetup() {
+    echo "[*] Removing dmsetup maps..."
+    dmsetup remove_all || true
 }
 
-remove_dmsetup() {
-    local d=$1
-    log "Removing device-mapper maps for /dev/$d..."
-    dmsetup ls --tree | grep "$d" | awk '{print $1}' | while read -r map; do
-        dmsetup remove -f "$map" || true
-    done
-}
-
-zap_ceph() {
-    local d=$1
-    log "Zapping Ceph OSD metadata on /dev/$d..."
-    if command -v ceph-volume &>/dev/null; then
-        ceph-volume lvm zap --destroy "/dev/$d" || true
-    else
-        log "ceph-volume not installed, skipping..."
+### STEP 6 - Ceph zap
+do_ceph() {
+    if command -v ceph-volume >/dev/null; then
+        echo "[*] Zapping Ceph on $TARGET..."
+        ceph-volume lvm zap --destroy "$TARGET" || true
     fi
 }
 
-zap_zfs() {
-    local d=$1
-    log "Cleaning ZFS labels on /dev/$d..."
-    if command -v zpool &>/dev/null; then
-        zpool labelclear -f "/dev/$d" || true
-    else
-        log "zpool not installed, skipping..."
+### STEP 7 - ZFS cleanup
+do_zfs() {
+    if command -v zpool >/dev/null; then
+        echo "[*] Cleaning ZFS labels on $TARGET..."
+        zpool labelclear -f "$TARGET" || true
     fi
 }
 
-wipe_signatures() {
-    local d=$1
-    log "Wiping signatures on /dev/$d..."
-    wipefs -a -f "/dev/$d" || true
-    sgdisk --zap-all "/dev/$d" || true
-    dd if=/dev/zero of="/dev/$d" bs=1M count=10 oflag=direct,dsync status=none || true
+### STEP 8 - Wipefs + GPT zap + dd
+do_wipe() {
+    echo "[*] Wiping filesystem signatures..."
+    wipefs -a -f "$TARGET"
+
+    if command -v sgdisk >/dev/null; then
+        echo "[*] Zapping GPT on $TARGET..."
+        sgdisk --zap-all "$TARGET" || true
+    fi
+
+    echo "[*] Zeroing first 10MB on $TARGET..."
+    dd if=/dev/zero of="$TARGET" bs=1M count=10 conv=fsync status=progress || true
 }
 
-reload_kernel() {
-    local d=$1
-    log "Reloading kernel partition table on /dev/$d..."
-    partprobe "/dev/$d" || true
+### STEP 9 - Reload kernel
+do_reload() {
+    echo "[*] Reloading partition table..."
+    partprobe "$TARGET" || true
+    blockdev --rereadpt "$TARGET" || true
 }
 
-wipe_disk() {
-    local d=$1
-    [[ ! -b /dev/$d ]] && { err "/dev/$d not found"; return 1; }
-    [[ "$d" == "sda" ]] && { err "Skipping system disk /dev/sda"; return 1; }
-
-    log "=== Starting disk wipe for /dev/$d ==="
-    unmount_partitions "$d"
-    disable_swap "$d"
-    deactivate_lvm "$d"
-    remove_dmsetup "$d"
-    zap_ceph "$d"
-    zap_zfs "$d"
-    wipe_signatures "$d"
-    reload_kernel "$d"
-    log "=== Done wiping /dev/$d ==="
+### STEP 10 - Verify
+do_verify() {
+    echo "[*] Final state of $TARGET:"
+    lsblk "$TARGET"
 }
 
-# === MAIN ===
-check_root
-check_tools
+### MAIN
+validate_target "$@"
+check_prereq
+do_unmount
+do_swapoff
+do_lvm
+do_dmsetup
+do_ceph
+do_zfs
+do_wipe
+do_reload
+do_verify
 
-if [[ $# -eq 0 ]]; then
-    usage
-fi
-
-if [[ "$1" == "--all" ]]; then
-    WIPE_ALL=true
-else
-    DISK=$1
-fi
-
-if $WIPE_ALL; then
-    for d in $(lsblk -dn -o NAME | grep -v "^sda$"); do
-        wipe_disk "$d"
-    done
-else
-    wipe_disk "$DISK"
-fi
+echo "[✓] Disk $TARGET wiped successfully."
