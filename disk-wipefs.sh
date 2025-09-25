@@ -191,9 +191,31 @@ is_tool_installed() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Check if all required tools are available
+check_required_tools() {
+    log_step "Checking required tools..."
+    
+    local missing_tools=()
+    
+    # Check required tools only (not optional ones)
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        if ! is_tool_installed "$tool"; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    if [ ${#missing_tools[@]} -eq 0 ]; then
+        log_ok "All required tools are available"
+        return 0
+    else
+        log_warn "Missing required tools: ${missing_tools[*]}"
+        return 1
+    fi
+}
+
 # Install missing tools
 install_missing_tools() {
-    log_step "Checking required tools..."
+    log_step "Installing missing tools..."
     
     local missing_tools=()
     local missing_packages=()
@@ -213,12 +235,11 @@ install_missing_tools() {
     done
     
     if [ ${#missing_tools[@]} -eq 0 ]; then
-        log_ok "All required tools are available"
+        log_ok "All tools are now available"
         return 0
     fi
     
-    log_warn "Missing tools: ${missing_tools[*]}"
-    log_step "Installing missing packages..."
+    log_info "Tools to install: ${missing_tools[*]}"
     
     # Fix CD-ROM sources before package installation
     fix_cdrom_sources
